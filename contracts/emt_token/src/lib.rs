@@ -99,13 +99,13 @@ impl EmtToken {
 
     // ── Token Metadata ────────────────────────────────────────────────────────
 
-    pub fn name(_env: Env) -> String {
+    pub fn name(env: Env) -> String {
         // TODO: store name in contract storage so it can be set at init
-        String::from_str(&_env, "Euro EMT")
+        String::from_str(&env, "Euro EMT")
     }
 
-    pub fn symbol(_env: Env) -> String {
-        String::from_str(&_env, "EUREMT")
+    pub fn symbol(env: Env) -> String {
+        String::from_str(&env, "EUREMT")
     }
 
     /// 7 decimal places — matches Stellar Classic convention

@@ -97,7 +97,7 @@ impl OracleInterface {
         let is_attestor: bool = env
             .storage()
             .persistent()
-            .get(&DataKey::Attestor(attestor))
+            .get(&DataKey::Attestor(attestor.clone()))
             .unwrap_or(false);
         assert!(is_attestor, "not an authorised attestor");
 
