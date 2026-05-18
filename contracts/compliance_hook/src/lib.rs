@@ -67,11 +67,7 @@ impl ComplianceHook {
     /// - Store approval timestamp and expiry ledger
     /// - Emit an event for indexers
     pub fn approve_transaction(env: Env, tx_hash: BytesN<32>) {
-        let hook_server: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::HookServer)
-            .unwrap();
+        let hook_server: Address = env.storage().instance().get(&DataKey::HookServer).unwrap();
         hook_server.require_auth();
 
         env.storage()
@@ -81,11 +77,7 @@ impl ComplianceHook {
 
     /// Reject a transaction (e.g., sanctions hit).
     pub fn reject_transaction(env: Env, tx_hash: BytesN<32>) {
-        let hook_server: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::HookServer)
-            .unwrap();
+        let hook_server: Address = env.storage().instance().get(&DataKey::HookServer).unwrap();
         hook_server.require_auth();
 
         env.storage()
@@ -123,7 +115,7 @@ mod tests {
     fn test_approve_and_check() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(ComplianceHook, ());
+        let contract_id = env.register_contract(None, ComplianceHook);
         let client = ComplianceHookClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);

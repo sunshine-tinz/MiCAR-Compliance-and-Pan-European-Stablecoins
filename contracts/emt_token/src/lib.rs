@@ -334,9 +334,7 @@ impl EmtToken {
     }
 
     pub fn reserve_attestation(env: Env) -> Option<String> {
-        env.storage()
-            .instance()
-            .get(&DataKey::ReserveAttestation)
+        env.storage().instance().get(&DataKey::ReserveAttestation)
     }
 
     // ── Role Management ───────────────────────────────────────────────────────
@@ -350,16 +348,12 @@ impl EmtToken {
 
     pub fn update_minter(env: Env, new_minter: Address) {
         Self::require_admin(&env);
-        env.storage()
-            .instance()
-            .set(&DataKey::Minter, &new_minter);
+        env.storage().instance().set(&DataKey::Minter, &new_minter);
     }
 
     pub fn update_pauser(env: Env, new_pauser: Address) {
         Self::require_admin(&env);
-        env.storage()
-            .instance()
-            .set(&DataKey::Pauser, &new_pauser);
+        env.storage().instance().set(&DataKey::Pauser, &new_pauser);
     }
 
     pub fn update_blocklister(env: Env, new_blocklister: Address) {
@@ -387,11 +381,7 @@ impl EmtToken {
     }
 
     fn require_blocklister(env: &Env) {
-        let blocklister: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Blocklister)
-            .unwrap();
+        let blocklister: Address = env.storage().instance().get(&DataKey::Blocklister).unwrap();
         blocklister.require_auth();
     }
 
@@ -422,10 +412,17 @@ mod tests {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
 
-    fn setup() -> (Env, Address, Address, Address, Address, EmtTokenClient<'static>) {
+    fn setup() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        Address,
+        EmtTokenClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(EmtToken, ());
+        let contract_id = env.register_contract(None, EmtToken);
         let client = EmtTokenClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -441,9 +438,9 @@ mod tests {
     fn test_mint_and_balance() {
         let (env, _admin, _minter, _pauser, _blocklister, client) = setup();
         let user = Address::generate(&env);
-        client.mint(&user, &1_000_000_0); // 1.0 EUREMT (7 decimals)
-        assert_eq!(client.balance(&user), 1_000_000_0);
-        assert_eq!(client.total_supply(), 1_000_000_0);
+        client.mint(&user, &10_000_000); // 1.0 EUREMT (7 decimals)
+        assert_eq!(client.balance(&user), 10_000_000);
+        assert_eq!(client.total_supply(), 10_000_000);
     }
 
     #[test]
@@ -451,10 +448,10 @@ mod tests {
         let (env, _admin, _minter, _pauser, _blocklister, client) = setup();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
-        client.mint(&alice, &500_000_0);
-        client.transfer(&alice, &bob, &200_000_0);
-        assert_eq!(client.balance(&alice), 300_000_0);
-        assert_eq!(client.balance(&bob), 200_000_0);
+        client.mint(&alice, &5_000_000);
+        client.transfer(&alice, &bob, &2_000_000);
+        assert_eq!(client.balance(&alice), 3_000_000);
+        assert_eq!(client.balance(&bob), 2_000_000);
     }
 
     #[test]
@@ -463,9 +460,9 @@ mod tests {
         let (env, _admin, _minter, _pauser, _blocklister, client) = setup();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
-        client.mint(&alice, &500_000_0);
+        client.mint(&alice, &5_000_000);
         client.blocklist(&bob);
-        client.transfer(&alice, &bob, &100_000_0);
+        client.transfer(&alice, &bob, &1_000_000);
     }
 
     #[test]
@@ -474,19 +471,19 @@ mod tests {
         let (env, _admin, _minter, _pauser, _blocklister, client) = setup();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
-        client.mint(&alice, &500_000_0);
+        client.mint(&alice, &5_000_000);
         client.pause();
-        client.transfer(&alice, &bob, &100_000_0);
+        client.transfer(&alice, &bob, &1_000_000);
     }
 
     #[test]
     fn test_burn() {
         let (env, _admin, _minter, _pauser, _blocklister, client) = setup();
         let user = Address::generate(&env);
-        client.mint(&user, &1_000_000_0);
-        client.burn(&user, &400_000_0);
-        assert_eq!(client.balance(&user), 600_000_0);
-        assert_eq!(client.total_supply(), 600_000_0);
+        client.mint(&user, &10_000_000);
+        client.burn(&user, &4_000_000);
+        assert_eq!(client.balance(&user), 6_000_000);
+        assert_eq!(client.total_supply(), 6_000_000);
     }
 
     // TODO: add tests for clawback, role transfers, reserve attestation

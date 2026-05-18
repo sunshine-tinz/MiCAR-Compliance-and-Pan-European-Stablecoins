@@ -118,9 +118,7 @@ impl OracleInterface {
         env.storage()
             .persistent()
             .set(&DataKey::Attestation(next_seq), &attestation);
-        env.storage()
-            .instance()
-            .set(&DataKey::LatestSeq, &next_seq);
+        env.storage().instance().set(&DataKey::LatestSeq, &next_seq);
     }
 
     /// Get the latest attestation.
@@ -133,16 +131,12 @@ impl OracleInterface {
         if seq == 0 {
             return None;
         }
-        env.storage()
-            .persistent()
-            .get(&DataKey::Attestation(seq))
+        env.storage().persistent().get(&DataKey::Attestation(seq))
     }
 
     /// Get attestation by sequence number (for historical audit).
     pub fn get_attestation(env: Env, seq: u64) -> Option<Attestation> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Attestation(seq))
+        env.storage().persistent().get(&DataKey::Attestation(seq))
     }
 
     fn require_admin(env: &Env) {
@@ -161,7 +155,7 @@ mod tests {
     fn test_submit_and_retrieve_attestation() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(OracleInterface, ());
+        let contract_id = env.register_contract(None, OracleInterface);
         let client = OracleInterfaceClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -171,14 +165,14 @@ mod tests {
 
         client.submit_attestation(
             &attestor,
-            &1_000_000_00i128, // 1,000,000.00 EUR
-            &999_000_00i128,   // 999,000.00 EUR tokens outstanding
+            &100_000_000i128, // 1,000,000.00 EUR (in cents)
+            &99_900_000i128,  // 999,000.00 EUR tokens outstanding (in cents)
             &String::from_str(&env, "QmExampleIPFSHash"),
         );
 
         let att = client.latest_attestation().unwrap();
-        assert_eq!(att.reserve_balance, 1_000_000_00);
-        assert_eq!(att.token_supply, 999_000_00);
+        assert_eq!(att.reserve_balance, 100_000_000);
+        assert_eq!(att.token_supply, 99_900_000);
     }
 
     // TODO: test quorum, staleness, unauthorised attestor rejection
