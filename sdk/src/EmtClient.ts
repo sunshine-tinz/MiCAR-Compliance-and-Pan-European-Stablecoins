@@ -1,11 +1,11 @@
 /**
  * EMT Token SDK Client
  *
- * Wraps the Soroban EMT token contract with a typed TypeScript interface.
+ * TypeScript wrapper for the Soroban EMT token contract.
  *
- * ## Usage
+ * ## Quick Start
  * ```ts
- * import { EmtClient } from "@eur-emt/sdk";
+ * import { EmtClient, Networks } from "@eur-emt/sdk";
  *
  * const client = new EmtClient({
  *   contractId: "C...",
@@ -13,124 +13,582 @@
  *   rpcUrl: "https://soroban-testnet.stellar.org",
  * });
  *
- * const balance = await client.balance("G...");
+ * const balance = await client.getBalance("G...");
  * ```
  *
- * ## TODO for Contributors
- * - [ ] Add `transfer` method with SEP-0008 hook pre-flight
- * - [ ] Add `mint` and `burn` methods
- * - [ ] Add `blocklist` / `unblocklist` admin methods
- * - [ ] Add `pause` / `unpause` admin methods
- * - [ ] Add event subscription helpers (listen for MINT, BURN, TRANSFER events)
- * - [ ] Add retry logic for RPC failures
- * - [ ] Write unit tests with a mock Soroban RPC server
+ * ## Caveats
+ *
+ * - **Read methods** use `simulateTransaction` with a randomly-generated
+ *   source keypair — this works against every public Soroban RPC but may
+ *   be rejected by mainnet-grade RPCs that enforce source-account funding
+ *   even for simulations.
+ * - **Reads are eventually consistent**: a write that has just landed may
+ *   take 1–2 ledgers (~5–10 s) to be visible to subsequent simulations.
+ *
+ * ## Errors
+ * All RPC / simulation / contract-panic failures throw {@link EmtClientError}.
  */
 
 import {
+  Account,
+  Address,
+  BASE_FEE as SDK_BASE_FEE,
   Contract,
-  Networks,
-  SorobanRpc,
-  TransactionBuilder,
-  BASE_FEE,
   Keypair,
   nativeToScVal,
+  Networks,
   scValToNative,
-  Address,
+  SorobanRpc,
+  TransactionBuilder,
+  xdr,
 } from "@stellar/stellar-sdk";
 
-export interface EmtClientConfig {
-  contractId: string;
-  networkPassphrase: string;
-  rpcUrl: string;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Coerce `BASE_FEE` (string in some SDK minors, number in others) to a
+ * number. Default is 100 stroops.
+ */
+const DEFAULT_BASE_FEE_NUM: number =
+  typeof SDK_BASE_FEE === "string" ? Number(SDK_BASE_FEE) : SDK_BASE_FEE;
+
+/** SDK TransactionBuilder wants a string for `fee`. */
+function feeToString(fee: number): string {
+  return fee.toString();
 }
 
+/** Convert a native value from `scValToNative` to a bigint. */
+function toBigInt(value: unknown): bigint {
+  if (typeof value === "bigint") return value;
+  return BigInt(String(value));
+}
+
+/** Convert a native value from `scValToNative` to a JS number. */
+function toNumber(value: unknown): number {
+  if (typeof value === "number") return value;
+  return Number(value);
+}
+
+/** Convert a native value from `scValToNative` to a string. */
+function toString(value: unknown): string {
+  return String(value);
+}
+
+// ── Public Types ──────────────────────────────────────────────────────────────
+
+export interface EmtClientConfig {
+  /** Contract address (`C...`). */
+  contractId: string;
+  /** Network passphrase (e.g. `Networks.TESTNET`). */
+  networkPassphrase: string;
+  /** Soroban RPC URL. */
+  rpcUrl: string;
+  /**
+   * Optional override for the transaction base fee (in stroops).
+   * Defaults to the SDK's `BASE_FEE`.
+   */
+  baseFee?: number;
+}
+
+/** Result of a submitted write call. */
+export interface SubmitResult {
+  /** Transaction hash. */
+  hash: string;
+  /** Decoded return value, if any. */
+  result: unknown;
+  /** Status returned by the RPC. */
+  status: string;
+}
+
+/**
+ * Thrown by read or write helpers on RPC / simulation / contract errors.
+ * The original error is retained in `.cause` for inspection.
+ */
+export class EmtClientError extends Error {
+  public readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "EmtClientError";
+    this.cause = cause;
+  }
+}
+
+// ── Client ────────────────────────────────────────────────────────────────────
+
+/**
+ * High-level Soroban client for the MiCAR EMT contract.
+ *
+ * - Read methods:
+ *   `simulateTransaction` against an unfunded random source account.
+ * - Write methods:
+ *   `build → simulate → assembleTransaction (footprint + fee) → build →
+ *    sign → sendTransaction → poll getTransaction until confirmed`.
+ *
+ * Compatible with `@stellar/stellar-sdk@12.x`.
+ */
 export class EmtClient {
-  private contract: Contract;
-  private server: SorobanRpc.Server;
-  private config: EmtClientConfig;
+  private readonly contract: Contract;
+  private readonly server: SorobanRpc.Server;
+  private readonly baseFee: string;
+  private readonly networkPassphrase: string;
 
   constructor(config: EmtClientConfig) {
-    this.config = config;
+    if (!config.contractId) throw new EmtClientError("contractId is required");
+    if (!config.networkPassphrase)
+      throw new EmtClientError("networkPassphrase is required");
+    if (!config.rpcUrl) throw new EmtClientError("rpcUrl is required");
+
+    const feeNum =
+      typeof config.baseFee === "number" && !Number.isNaN(config.baseFee)
+        ? config.baseFee
+        : DEFAULT_BASE_FEE_NUM;
+    this.baseFee = feeToString(feeNum);
+    this.networkPassphrase = config.networkPassphrase;
+
     this.contract = new Contract(config.contractId);
-    this.server = new SorobanRpc.Server(config.rpcUrl);
+    this.server = new SorobanRpc.Server(config.rpcUrl, {
+      allowHttp: config.rpcUrl.startsWith("http://"),
+    });
+  }
+
+  // ── Read methods ──────────────────────────────────────────────────────────
+
+  /** Get the balance of `account` (7 decimal places, smallest unit). */
+  async getBalance(account: string): Promise<bigint> {
+    return toBigInt(await this.simulateView("balance", [this.addressArg(account)]));
+  }
+
+  /** Get the current total supply. */
+  async getTotalSupply(): Promise<bigint> {
+    return toBigInt(await this.simulateView("total_supply", []));
+  }
+
+  /** True if the contract is in the paused state. */
+  async isPaused(): Promise<boolean> {
+    return Boolean(await this.simulateView("is_paused", []));
+  }
+
+  /** True if `account` is on the blocklist. */
+  async isBlocklisted(account: string): Promise<boolean> {
+    return Boolean(
+      await this.simulateView("is_blocklisted", [this.addressArg(account)])
+    );
+  }
+
+  /** Allowance granted by `owner` to `spender`. */
+  async getAllowance(owner: string, spender: string): Promise<bigint> {
+    return toBigInt(
+      await this.simulateView("allowance", [
+        this.addressArg(owner),
+        this.addressArg(spender),
+      ])
+    );
+  }
+
+  /** Token name (e.g. "Euro EMT"). */
+  async getName(): Promise<string> {
+    return toString(await this.simulateView("name", []));
+  }
+
+  /** Token symbol (e.g. "EUREMT"). */
+  async getSymbol(): Promise<string> {
+    return toString(await this.simulateView("symbol", []));
+  }
+
+  /** Decimal places (always 7 for this token). */
+  async getDecimals(): Promise<number> {
+    return toNumber(await this.simulateView("decimals", []));
+  }
+
+  /** Latest reserve attestation IPFS hash, if any. */
+  async getReserveAttestation(): Promise<string | null> {
+    const value = await this.simulateView("reserve_attestation", []);
+    return value == null ? null : toString(value);
+  }
+
+  // ── Write methods ─────────────────────────────────────────────────────────
+
+  /** Transfer tokens from `from` to `to` (`from` signs via `sourceKeypair`). */
+  async transfer(args: {
+    from: string;
+    to: string;
+    amount: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [
+        this.addressArg(args.from),
+        this.addressArg(args.to),
+        this.i128Arg(args.amount),
+      ],
+      args.sourceKeypair,
+      "transfer"
+    );
+  }
+
+  /** Mint tokens (minter role required). */
+  async mint(args: {
+    to: string;
+    amount: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.to), this.i128Arg(args.amount)],
+      args.sourceKeypair,
+      "mint"
+    );
+  }
+
+  /** Burn tokens (minter role required). */
+  async burn(args: {
+    from: string;
+    amount: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.from), this.i128Arg(args.amount)],
+      args.sourceKeypair,
+      "burn"
+    );
+  }
+
+  /** Approve `spender` to transfer up to `amount` on behalf of `from`. */
+  async approve(args: {
+    from: string;
+    spender: string;
+    amount: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [
+        this.addressArg(args.from),
+        this.addressArg(args.spender),
+        this.i128Arg(args.amount),
+      ],
+      args.sourceKeypair,
+      "approve"
+    );
+  }
+
+  /** Transfer tokens using a granted allowance (spender signs). */
+  async transferFrom(args: {
+    spender: string;
+    from: string;
+    to: string;
+    amount: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [
+        this.addressArg(args.spender),
+        this.addressArg(args.from),
+        this.addressArg(args.to),
+        this.i128Arg(args.amount),
+      ],
+      args.sourceKeypair,
+      "transfer_from"
+    );
+  }
+
+  /** Pause all transfers (pauser role required). */
+  async pause(sourceKeypair: Keypair): Promise<SubmitResult> {
+    return this.invokeWrite([], sourceKeypair, "pause");
+  }
+
+  /** Resume operations (pauser role required). */
+  async unpause(sourceKeypair: Keypair): Promise<SubmitResult> {
+    return this.invokeWrite([], sourceKeypair, "unpause");
+  }
+
+  /** Add `account` to the blocklist (blocklister role required). */
+  async blocklist(args: {
+    account: string;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.account)],
+      args.sourceKeypair,
+      "blocklist"
+    );
+  }
+
+  /** Remove `account` from the blocklist (blocklister role required). */
+  async unblocklist(args: {
+    account: string;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.account)],
+      args.sourceKeypair,
+      "unblocklist"
+    );
+  }
+
+  /** Force-revoke tokens from `from` (admin role required). */
+  async clawback(args: {
+    from: string;
+    amount: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.from), this.i128Arg(args.amount)],
+      args.sourceKeypair,
+      "clawback"
+    );
+  }
+
+  /** Update the on-chain IPFS CID of the reserve attestation (admin). */
+  async setReserveAttestation(args: {
+    hash: string;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [nativeToScVal(args.hash, { type: "string" })],
+      args.sourceKeypair,
+      "set_reserve_attestation"
+    );
+  }
+
+  // ── Two-step admin handover ───────────────────────────────────────────────
+
+  /**
+   * Step 1 of the admin handover. The **current** admin proposes a
+   * successor. The successor must separately {@link acceptAdmin} before
+   * the role change takes effect.
+   */
+  async proposeAdmin(args: {
+    newAdmin: string;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.newAdmin)],
+      args.sourceKeypair,
+      "propose_admin"
+    );
   }
 
   /**
-   * Get the token balance of an address.
-   * Returns balance in the token's smallest unit (7 decimal places).
+   * Step 2 of the admin handover. The **proposed** successor calls this
+   * to take on the admin role. Auth is required from the proposed address.
    */
-  async balance(address: string): Promise<bigint> {
-    const account = await this.server.getAccount(address);
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.config.networkPassphrase,
-    })
-      .addOperation(
-        this.contract.call(
-          "balance",
-          nativeToScVal(Address.fromString(address), { type: "address" })
-        )
-      )
-      .setTimeout(30)
-      .build();
-
-    const result = await this.server.simulateTransaction(tx);
-    if (SorobanRpc.Api.isSimulationError(result)) {
-      throw new Error(`Simulation failed: ${result.error}`);
-    }
-
-    return scValToNative(result.result!.retval) as bigint;
+  async acceptAdmin(sourceKeypair: Keypair): Promise<SubmitResult> {
+    return this.invokeWrite([], sourceKeypair, "accept_admin");
   }
 
   /**
-   * Get the total token supply.
+   * The **current** admin can withdraw a pending proposal. Useful when the
+   * originally proposed successor is no longer capable (e.g. lost keys,
+   * wrong address).
    */
-  async totalSupply(callerAddress: string): Promise<bigint> {
-    const account = await this.server.getAccount(callerAddress);
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.config.networkPassphrase,
-    })
-      .addOperation(this.contract.call("total_supply"))
-      .setTimeout(30)
-      .build();
+  async cancelProposedAdmin(sourceKeypair: Keypair): Promise<SubmitResult> {
+    return this.invokeWrite([], sourceKeypair, "cancel_proposed_admin");
+  }
 
-    const result = await this.server.simulateTransaction(tx);
-    if (SorobanRpc.Api.isSimulationError(result)) {
-      throw new Error(`Simulation failed: ${result.error}`);
+  /** Current pending admin proposal, if any.
+   * Returns `null` when no proposal is in flight, otherwise the proposed
+   * successor's G-address. */
+  async getPendingAdmin(): Promise<string | null> {
+    const value = await this.simulateView("pending_admin", []);
+    return value == null ? null : toString(value);
+  }
+
+  // ── Velocity Limits (MiCAR Art. 46) ────────────────────────────────────
+
+  /** Set the global default 24h outgoing-volume cap (admin). `0n` disables
+   * capping. Addresses without a per-address override use this limit. */
+  async setGlobalVelocityLimit(args: {
+    limit: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.i128Arg(args.limit)],
+      args.sourceKeypair,
+      "set_global_velocity_limit"
+    );
+  }
+
+  /** Set a per-address override (admin). `0n` makes the address unlimited
+   * regardless of the global default. Use {@link clearVelocityLimit} to
+   * restore the global fallback. */
+  async setVelocityLimit(args: {
+    address: string;
+    limit: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.address), this.i128Arg(args.limit)],
+      args.sourceKeypair,
+      "set_velocity_limit"
+    );
+  }
+
+  /** Clear a per-address override, falling back to the global default (admin). */
+  async clearVelocityLimit(args: {
+    address: string;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.addressArg(args.address)],
+      args.sourceKeypair,
+      "clear_velocity_limit"
+    );
+  }
+
+  /** Effective 24h velocity limit for `address` (per-address override
+   * takes precedence). `0n` means unlimited. */
+  async getVelocityLimit(address: string): Promise<bigint> {
+    return toBigInt(
+      await this.simulateView("get_velocity_limit", [this.addressArg(address)])
+    );
+  }
+
+  /** Currently-accumulated outgoing volume in the 24h sliding window.
+   * Useful to surface "you can transfer at most X more today" before
+   * attempting a transfer that the contract would reject for velocity. */
+  async getOutflowToday(address: string): Promise<bigint> {
+    return toBigInt(
+      await this.simulateView("get_outflow_today", [this.addressArg(address)])
+    );
+  }
+
+  // ── Internals ─────────────────────────────────────────────────────────────
+
+  /**
+   * Call a read-only (view) function via simulation. No transaction is
+   * submitted. The source account is a random keypair — funding isn't
+   * required because simulation only consumes compute on the RPC.
+   */
+  private async simulateView(
+    method: string,
+    args: ReturnType<typeof nativeToScVal>[]
+  ): Promise<unknown> {
+    try {
+      const op = this.contract.call(method, ...args);
+      const source = new Account(Keypair.random().publicKey(), "0");
+      const tx = new TransactionBuilder(source, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
+
+      const result = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(result)) {
+        throw new Error(`Simulation failed: ${result.error}`);
+      }
+      if (!result.result) {
+        throw new Error("Simulation succeeded with no return value");
+      }
+      return scValToNative(result.result.retval);
+    } catch (err) {
+      throw new EmtClientError(
+        `view call "${method}" failed: ${(err as Error).message}`,
+        err
+      );
     }
-
-    return scValToNative(result.result!.retval) as bigint;
   }
 
   /**
-   * Check whether the contract is paused.
+   * Build → simulate → `SorobanRpc.assembleTransaction` (which returns a
+   * `TransactionBuilder` with footprint + resource fee pre-applied) →
+   * `build()` → sign → submit → poll `getTransaction` until confirmed.
    */
-  async isPaused(callerAddress: string): Promise<boolean> {
-    const account = await this.server.getAccount(callerAddress);
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.config.networkPassphrase,
-    })
-      .addOperation(this.contract.call("is_paused"))
-      .setTimeout(30)
-      .build();
+  private async invokeWrite(
+    args: ReturnType<typeof nativeToScVal>[],
+    sourceKeypair: Keypair,
+    method: string
+  ): Promise<SubmitResult> {
+    try {
+      // `simulateView` works because it doesn't need a funded source;
+      // writes do, so always fetch the real source account.
+      const source = await this.server.getAccount(sourceKeypair.publicKey());
+      const op = this.contract.call(method, ...args);
+      const tx = new TransactionBuilder(source, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
 
-    const result = await this.server.simulateTransaction(tx);
-    if (SorobanRpc.Api.isSimulationError(result)) {
-      throw new Error(`Simulation failed: ${result.error}`);
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        throw new Error(
+          `simulation for "${method}" failed: ${
+            (sim as { error?: string }).error ?? JSON.stringify(sim)
+          }`
+        );
+      }
+
+      // `assembleTransaction` returns a TransactionBuilder pre-loaded
+      // with footprint & minimum resource fee. `.build()` turns it into
+      // an actual Transaction we can sign and submit.
+      const preparedBuilder = SorobanRpc.assembleTransaction(tx, sim);
+      const prepared = preparedBuilder.build();
+      prepared.sign(sourceKeypair);
+
+      const sendRes = await this.server.sendTransaction(prepared);
+      const hash = sendRes.hash;
+      if (sendRes.status !== "PENDING") {
+        throw new Error(
+          `sendTransaction returned unexpected status: ${sendRes.status}`
+        );
+      }
+
+      // Poll until the transaction is included in a ledger, accepted, or
+      // definitively fails. `getTransaction` returns NOT_FOUND while the
+      // ledger hasn't seen it yet.
+      let final: SorobanRpc.Api.GetTransactionResponse | undefined;
+      const maxWaitMs = 30_000;
+      const pollIntervalMs = 1_000;
+      const pollStart = Date.now();
+      while (
+        final === undefined ||
+        final.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND
+      ) {
+        if (Date.now() - pollStart > maxWaitMs) {
+          throw new Error(`timed out waiting for transaction ${hash}`);
+        }
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        final = await this.server.getTransaction(hash);
+      }
+
+      if (final.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+        // Cast inline to a single object shape carrying the optional
+        // `result.retval` of type `xdr.ScVal`. Inline avoids an `Extract`
+        // type that may collapse to `never` depending on how the SDK
+        // exposes its `GetTransactionStatus` enum.
+        const retval = (final as unknown as {
+          result?: { retval?: xdr.ScVal };
+        }).result?.retval;
+        return {
+          hash,
+          result: retval ? scValToNative(retval) : undefined,
+          status: final.status,
+        };
+      }
+
+      throw new Error(
+        `transaction ${hash} ended in status ${final.status}: ${JSON.stringify(final)}`
+      );
+    } catch (err) {
+      throw new EmtClientError(
+        `write call "${method}" failed: ${(err as Error).message}`,
+        err
+      );
     }
-
-    return scValToNative(result.result!.retval) as boolean;
   }
 
-  // TODO: implement transfer(), mint(), burn(), pause(), blocklist(), etc.
-  // Each method should:
-  // 1. Build the transaction
-  // 2. Simulate to get the footprint
-  // 3. Sign with the provided keypair
-  // 4. Submit and wait for confirmation
-  // 5. Return the transaction hash
+  private addressArg(addr: string): ReturnType<typeof nativeToScVal> {
+    return nativeToScVal(Address.fromString(addr), { type: "address" });
+  }
+
+  private i128Arg(value: bigint): ReturnType<typeof nativeToScVal> {
+    return nativeToScVal(value, { type: "i128" });
+  }
 }
 
+// Re-export Networks so consumers don't need a direct dependency on the SDK.
 export { Networks };
