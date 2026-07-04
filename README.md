@@ -1,106 +1,240 @@
 # MiCAR-Compliant Euro Stablecoin on Stellar
 
-A reference implementation of a **MiCAR-compliant Euro-pegged E-Money Token
-(EMT)** on the [Stellar](https://stellar.org) network using
-[Soroban](https://stellar.org/soroban) smart contracts.
+> A reference implementation of a **MiCAR-compliant Euro-pegged E-Money
+> Token (EMT)** on the **Stellar** network, written in **Soroban** smart
+> contracts and a typed **TypeScript SDK**.
 
-## Why This Exists
+[![CI](https://img.shields.io/badge/CI-configured-blue) — see [.github/workflows/ci.yml](.github/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
+[![Soroban SDK](https://img.shields.io/badge/soroban--sdk-21.0.0-purple)](contracts/Cargo.toml)
+[![Stellar](https://img.shields.io/badge/Stellar-Soroban-08b5e5)](https://stellar.org/soroban)
 
-MiCAR (Markets in Crypto-Assets Regulation) entered full application on
-30 December 2024, creating the world's most comprehensive stablecoin regulatory
-framework. The Euro stablecoin market has doubled since early 2025, reaching
-~$909M, driven entirely by MiCAR-compliant issuers.
+---
+
+## Why this project exists
+
+MiCAR (Regulation EU 2023/1114) entered full application on
+**30 December 2024**, the world's most comprehensive crypto-asset
+regulation. The Euro stablecoin market has grown rapidly since then,
+driven by a small but growing cohort of MiCAR-compliant issuers.
 
 Stellar is uniquely positioned for regulated stablecoins:
-- Built-in asset controls (freeze, clawback, authorization)
-- SEP-0008 standard for regulated asset compliance hooks
-- Fast finality (<6 seconds), low cost ($0.0007/tx)
-- Existing institutional deployments (EURCV by SG-Forge is live on Stellar)
 
-This project provides the open-source infrastructure layer that any
-EU-authorised EMI or credit institution can build on to issue a compliant
-Euro stablecoin on Stellar.
+- **Native asset controls** — freeze, clawback, authorization
+- **SEP-0008 Regulated Assets** — a battle-tested compliance-hook pattern
+- **Fast finality** — ~5 s ledger close
+- **Low cost** — a fraction of a cent per transaction
+- **Live institutional deployments** — EURCV by SG-Forge is on Stellar
+
+This repo gives any EU-authorised EMI or credit institution an open
+starting point to issue a compliant Euro stablecoin on Stellar.
+
+---
+
+## Table of contents
+
+1. [Architecture](#architecture)
+2. [Repository layout](#repository-layout)
+3. [Quick start](#quick-start)
+4. [MiCAR compliance matrix](#micar-compliance-matrix)
+5. [Project status](#project-status)
+6. [SEP-0008 compliance](#sep-0008-compliance)
+7. [Documentation](#documentation)
+8. [Security](#security)
+9. [Contributing](#contributing)
+10. [Reference implementations](#reference-implementations)
+11. [License](#license)
+
+---
 
 ## Architecture
 
+```text
+┌─────────────────────────────────────── Off-chain ──────────────────────────────────────┐
+│  KYC/AML provider  →  SEP-0008 hook server  (KYC · sanctions · limits · travel rule) │
+│  Reserve custodian →  Oracle attestors    (push attestations periodically)            │
+└──────────────────────────┬──────────────────────────────────────────────────────────────┘
+                           │ approve tx / submit attestation
+                           ▼
+┌─────────────────────────────────────── Soroban ───────────────────────────────────────┐
+│ emt_token            →  mint · burn · transfer · approve · transfer_from               │
+│                        pause · blocklist · clawback · reserve hash                    │
+│ compliance_hook      →  approve / reject / revoke tx-hashes (with TTL)                │
+│ oracle_interface     →  quorum + staleness + collateral ratio                          │
+└──────────────────────────┬──────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+                    TypeScript SDK  (@eur-emt/sdk)
 ```
-emt_token (Soroban)          compliance_hook (Soroban)
-  ├── mint / burn              ├── approve_transaction
-  ├── transfer                 └── reject_transaction
-  ├── blocklist / clawback
-  └── pause                  oracle_interface (Soroban)
-                               ├── submit_attestation
-SEP-0008 Hook Server           └── latest_attestation
-  ├── KYC screening
-  ├── Sanctions check        TypeScript SDK
-  └── Travel rule              └── EmtClient
+
+Read [`docs/architecture.md`](docs/architecture.md) for the full design.
+
+---
+
+## Repository layout
+
+```
+contracts/          Soroban smart contracts (Rust)
+├── emt_token/         Core EMT token (mint/burn/transfer/allowances)
+├── compliance_hook/   SEP-0008 approval ledger with TTL
+└── oracle_interface/  Reserve attestation oracle with quorum & freshness
+
+sdk/                TypeScript SDK (@eur-emt/sdk)
+├── src/
+│   ├── EmtClient.ts   Read & write methods, error wrapping
+│   └── index.ts       Public barrel
+└── README.md          SDK reference
+
+scripts/            Deployment scripts
+├── deploy.sh           Build wasm + deploy + write .deployment.json
+└── initialize.sh       Read .deployment.json + assign roles
+
+docs/               Design & compliance documentation
+├── architecture.md     System design
+├── micar-compliance.md MiCAR obligations mapping
+└── sep0008-hook.md     Off-chain hook server spec
+
+.github/workflows/  CI (fmt + clippy + test + sdk build + docs sanity)
+SECURITY.md         Vulnerability disclosure policy
+.env.example        Environment variable template
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
+---
 
-## MiCAR Compliance
-
-| Article | Requirement | Implementation |
-|---|---|---|
-| Art. 48 | Redemption at par | `burn()` + off-chain fiat release |
-| Art. 45 | Reserve segregation | `oracle_interface` attestations |
-| Art. 23 | AML/CFT controls | Blocklist + SEP-0008 hook |
-| Art. 46 | Transaction limits | TODO: velocity limits |
-| Art. 22 | Travel rule | TODO: hook server |
-
-See [docs/micar-compliance.md](docs/micar-compliance.md) for the full mapping.
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-- Rust + `wasm32-unknown-unknown` target
+- Rust (stable) **+** the `wasm32-unknown-unknown` target
 - [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli)
-- Node.js 20+
+- Node.js 20+ (for the SDK and scripts)
 
 ```bash
-# Install Rust wasm target
 rustup target add wasm32-unknown-unknown
-
-# Build contracts
-cd contracts && cargo build --release --target wasm32-unknown-unknown
-
-# Run tests
-cargo test
-
-# Install SDK
-cd ../sdk && npm install
+cargo install --locked stellar-cli --features opt
 ```
 
-### Deploy to Testnet
+### Build & test the contracts
 
 ```bash
-export ADMIN_SECRET=S...
-export MINTER_ADDRESS=G...
-export PAUSER_ADDRESS=G...
-export BLOCKLISTER_ADDRESS=G...
-
-./scripts/deploy.sh
-./scripts/initialize.sh
+cd contracts
+cargo build --release --target wasm32-unknown-unknown
+cargo test                     # unit tests
+cargo clippy --all-targets -- -D warnings
 ```
+
+### Build the SDK
+
+```bash
+cd sdk
+npm install
+npm run build
+```
+
+### Deploy to testnet
+
+```bash
+cp .env.example .env
+# … fill in funded secret & address values, then:
+set -a && source .env && set +a
+
+./scripts/deploy.sh     # writes contract IDs to .deployment.json
+./scripts/initialize.sh # reads .deployment.json + assigns roles
+```
+
+A mainnet deployment is refused unless `I_UNDERSTAND_MAINNET=1` is set.
+
+---
+
+## MiCAR compliance matrix
+
+| Article | Requirement | Implementation |
+|---|---|---|
+| Art. 48 | Redemption at par | `emt_token::burn` + off-chain fiat release |
+| Art. 45 | Reserve segregation & attestation | `oracle_interface` (push oracle) + `EMT.reserve_attestation` |
+| Art. 23 | AML/CFT controls | `blocklist` + SEP-0008 hook + reserve oracle |
+| Art. 22 | Travel rule (> €1,000) | Hook server (off-chain) — _see `sep0008-hook.md`_ |
+| Art. 46 | Transaction limits | Per-address 24h velocity limit (two-bucket sliding window) + global default |
+| Art. 35 | Issuer authorisation | _Legal obligation — enforced outside the smart contracts_ |
+
+Read [`docs/micar-compliance.md`](docs/micar-compliance.md) for the full mapping.
+
+---
+
+## Project status
+
+| Component | Mint / Burn | Pause | Blocklist | Allowances | Reserve attest. | Admin handover |
+|---|---|---|---|---|---|---|
+| `emt_token` | ✅ | ✅ | ✅ | ✅ (`approve` / `transfer_from`) | ✅ | ✅ two-step (propose + accept) + cancel |
+| `compliance_hook` | ✅ approve/reject | ✅ revoke | ✅ expiry TTL | — | — | — |
+| `oracle_interface` | ✅ push attestations | ✅ quorum | ✅ staleness | ✅ collateral ratio | — | — |
+
+Things explicitly **not** done yet (see [`CONTRIBUTING.md`](CONTRIBUTING.md)):
+
+- Aggregated supply cap enforced in `mint()` (MiCAR Art. 46)
+- Fuzz / property-based tests
+- The actual off-chain SEP-0008 hook server (Node.js/TypeScript)
+
+---
+
+## SEP-0008 compliance
+
+For Stellar this is partially on-chain (the `compliance_hook` contract
+records approvals with a TTL) and partially off-chain (the hook server
+that screens KYC, sanctions, transaction limits, and travel-rule data
+before co-signing the user's transaction).
+
+See [`docs/sep0008-hook.md`](docs/sep0008-hook.md) for the off-chain
+server specification and the proposed OpenAPI surface.
+
+---
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — overall system design
+- [`docs/micar-compliance.md`](docs/micar-compliance.md) — per-article
+  obligation mapping
+- [`docs/sep0008-hook.md`](docs/sep0008-hook.md) — off-chain hook server
+- [`sdk/README.md`](sdk/README.md) — SDK reference
+- [`SECURITY.md`](SECURITY.md) — disclosure policy
+- [`.env.example`](.env.example) — environment template
+
+---
+
+## Security
+
+If you find a security issue, **do not open a public issue**. Email the
+maintainers directly per [`SECURITY.md`](SECURITY.md).
+
+Before deploying to mainnet with real funds, follow the **Pre-Launch
+Checklist** in `SECURITY.md`. Independent security audits and a bug
+bounty are required by the time real funds are involved.
+
+---
 
 ## Contributing
 
-This project is designed for open contribution. There are well-defined issues
-across contracts, SDK, and the SEP-0008 hook server at every complexity level.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues span three areas
+(contracts, SDK, hook server) and every complexity level, from trivial
+docs fixes to full reserve-oracle quorum logic.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full list of open issues and
-how to get started.
+---
 
-## Reference Implementations
+## Reference implementations
 
-This project adapts patterns from:
+Patterns adapted from:
 
 - **[circlefin/stablecoin-evm](https://github.com/circlefin/stablecoin-evm)**
-  (Apache-2.0) — Circle's USDC architecture on EVM
+  (Apache-2.0) — Circle's USDC architecture on EVM. Inspiration for the
+  role model, blocklist, and pause.
 - **[membranefi/euroe-stablecoin](https://github.com/membranefi/euroe-stablecoin)**
-  — Membrane Finance's MiCAR-compliant EUROe on Ethereum
+  — Membrane Finance's MiCAR-compliant EUROe on Ethereum. Same
+  regulatory regime, different chain — useful sanity check.
+- **[stellar/soroban-examples](https://github.com/stellar/soroban-examples)**
+  — official Soroban patterns (auth helpers, storage, events).
+
+---
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [`LICENSE`](LICENSE).

@@ -74,9 +74,8 @@ impact. Each maps to a GitHub issue.
 |---|---|---|
 | `transfer_from` | Delegated transfers with allowances | Medium |
 | `approve` | ERC-20-style allowance mechanism | Medium |
-| Transfer velocity limits | Per-address daily/weekly caps (MiCAR Art. 46) | High |
+| Transfer velocity limits | Per-address daily/weekly caps (MiCAR Art. 46) ✅ shipped | High |
 | Mint supply cap | Aggregate supply limit enforced in `mint()` | Trivial |
-| Two-step admin transfer | Propose + accept pattern for admin role handover | Medium |
 | Oracle integration | `mint()` checks oracle before proceeding | High |
 | Clawback policy | Define whether clawback burns or credits admin | Trivial |
 | Attestation expiry | Reject stale attestations in oracle_interface | Medium |
