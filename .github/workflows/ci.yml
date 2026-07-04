@@ -46,7 +46,8 @@ jobs:
     name: TypeScript SDK (build + typecheck + test)
     runs-on: ubuntu-latest
     defaults:
-      working-directory: sdk
+      run:
+        working-directory: sdk
     steps:
       - uses: actions/checkout@v4
 
