@@ -6,5 +6,9 @@
  */
 
 export { EmtClient, EmtClientError } from "./EmtClient";
-export type { EmtClientConfig, SubmitResult } from "./EmtClient";
+export type {
+  EmtClientConfig,
+  SubmitResult,
+  TtlExtendResult,
+} from "./EmtClient";
 export { Networks } from "@stellar/stellar-sdk";

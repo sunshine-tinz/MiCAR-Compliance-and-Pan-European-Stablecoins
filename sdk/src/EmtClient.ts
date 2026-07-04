@@ -114,6 +114,21 @@ export class EmtClientError extends Error {
   }
 }
 
+/**
+ * Result of {@link EmtClient.extendStorageTtl}. Splits the touched
+ * entries by kind so the calling cron / governance action can log them
+ * distinctly (e.g., to detect drift in the address book vs. the
+ * allowance book).
+ *
+ * Field names are kept in snake_case to match the underlying Soroban
+ * contract struct (`TtlExtendResult { addresses_touched, allowance_pairs_touched }`),
+ * which `scValToNative` round-trips without case conversion.
+ */
+export interface TtlExtendResult {
+  addresses_touched: number;
+  allowance_pairs_touched: number;
+}
+
 // ── Client ────────────────────────────────────────────────────────────────────
 
 /**
@@ -450,6 +465,36 @@ export class EmtClient {
     return toBigInt(
       await this.simulateView("get_outflow_today", [this.addressArg(address)])
     );
+  }
+
+  // ── MiCAR Retention (admin-driven) ───────────────────────────────────────
+
+  /**
+   * Batch-extend TTL on every Balance / Allowance / Blocklisted /
+   * VelocityLimit / VelocityState entry to the host ceiling
+   * (`max_entry_ttl` = 6_312_000 ledgers ≈ 1 year at ~5 s/ledger).
+   * Required by MiCAR Art. 23 / Art. 48 for 5-year record retention
+   * — the host ceiling is 1 year per call, so the calling cron must
+   * invoke this periodically (and rely on the per-write TTL bump in
+   * `write_balance` / `write_allowance` / `write_blocklist` between
+   * calls). Pausable state is intentionally NOT consulted so the
+   * entry can run during recovery.
+   *
+   * Admin only.
+   *
+   * @returns A {@link SubmitResult} augmented with
+   *   `result: TtlExtendResult` — i.e. the standard `{ hash, result, status }`
+   *   wrapper where `result` is the contract-side `TtlExtendResult`
+   *   struct (`{ addresses_touched: number, allowance_pairs_touched: number }`).
+   */
+  async extendStorageTtl(args: {
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult & { result: TtlExtendResult }> {
+    return this.invokeWrite(
+      [],
+      args.sourceKeypair,
+      "extend_storage_ttl"
+    ) as Promise<SubmitResult & { result: TtlExtendResult }>;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────

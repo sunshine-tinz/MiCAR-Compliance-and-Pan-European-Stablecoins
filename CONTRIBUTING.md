@@ -75,6 +75,9 @@ impact. Each maps to a GitHub issue.
 | `transfer_from` | Delegated transfers with allowances | Medium |
 | `approve` | ERC-20-style allowance mechanism | Medium |
 | Transfer velocity limits | Per-address daily/weekly caps (MiCAR Art. 46) ✅ shipped | High |
+| Two-step admin transfer | Propose + accept pattern for admin role handover ✅ shipped | Medium |
+| Extend-storage TTL entry point | `extend_storage_ttl` admin entry to batch-refresh persistent entry TTLs to the host ceiling for MiCAR Art. 23 / 48 5-year retention ✅ shipped | High |
+| Lazy-prune tracking books | Drop addresses from `TrackedAddresses` / `TrackedAllowances` once their balance has been zero for an extended period and they have no other persistent state, to keep the books bounded over the contract's lifetime | Medium |
 | Mint supply cap | Aggregate supply limit enforced in `mint()` | Trivial |
 | Oracle integration | `mint()` checks oracle before proceeding | High |
 | Clawback policy | Define whether clawback burns or credits admin | Trivial |

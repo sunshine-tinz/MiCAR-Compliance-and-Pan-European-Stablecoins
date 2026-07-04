@@ -26,15 +26,17 @@
 //! circulation unless explicitly re-minted.
 //!
 //! ## Open contribution items
-//! - [ ] Per-address transaction velocity limits (MiCAR Art. 46)
 //! - [ ] Oracle integration for automatic reserve sufficiency check
-//! - [ ] Two-step admin transfer (propose → accept)
 //! - [ ] Fuzz/property-based tests
+//! - [ ] Lazy-prune TrackedAddresses/TrackedAllowances for addresses
+//!   whose Balance has been zero for an extended period and which have
+//!   no other persistent state, to keep the books bounded as the
+//!   contract's lifetime grows
 
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, Map, String, Symbol, Vec,
 };
 
 // ── Velocity-limit constants (MiCAR Art. 46) ─────────────────────────────────
@@ -71,6 +73,18 @@ pub enum DataKey {
     VelocityLimit(Address),
     /// MiCAR Art. 46 — sliding-window volume tracker per sender.
     VelocityState(Address),
+    /// MiCAR Art. 23 / Art. 48 — tracked address book (set of every Address
+    /// that has ever written to a Balance, Blocklisted, VelocityLimit, or
+    /// VelocityState entry). Maintained by `track_address` from every
+    /// state-mutating call site. Used by `extend_storage_ttl` to enumerate
+    /// the address space for batch TTL extension.
+    TrackedAddresses,
+    /// MiCAR Art. 48 — tracked (owner, spender) pairs (set of every pair
+    /// that has ever had an `Allowance` entry). Maintained by
+    /// `track_allowance` from `approve` and `transfer_from`. Used by
+    /// `extend_storage_ttl` to enumerate the allowance space for batch
+    /// TTL extension.
+    TrackedAllowances,
     #[allow(dead_code)]
     MintLimit(Address),
 }
@@ -87,6 +101,19 @@ pub struct VelocityState {
     pub bucket_time: u32,
     pub current: i128,
     pub previous: i128,
+}
+
+/// Result of [`Self::extend_storage_ttl`].
+///
+/// Splits the touched entries by kind so the calling cron / governance
+/// action can log them distinctly (e.g., to detect drift in the address
+/// book vs. the allowance book). Deriving `PartialEq` lets tests use
+/// `assert_eq!` directly.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TtlExtendResult {
+    pub addresses_touched: u32,
+    pub allowance_pairs_touched: u32,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -107,6 +134,8 @@ const PROPOSE: Symbol = symbol_short!("PROPOSE");
 const ACCEPT_AD: Symbol = symbol_short!("ACCEPT");
 /// Admin transfer proposal cancelled by the current admin.
 const CANCEL_AD: Symbol = symbol_short!("CANCEL");
+/// Batch TTL extension ran (MiCAR Art. 23 / Art. 48 retention).
+const TTL_EXT: Symbol = symbol_short!("TTL_EXT");
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -209,6 +238,8 @@ impl EmtToken {
 
         assert!(amount > 0, "amount must be positive");
 
+        Self::track_address(&env, &to);
+
         let new_balance = Self::balance(env.clone(), to.clone()) + amount;
         Self::write_balance(&env, to.clone(), new_balance);
 
@@ -232,6 +263,8 @@ impl EmtToken {
         Self::require_minter(&env);
 
         assert!(amount > 0, "amount must be positive");
+
+        Self::track_address(&env, &from);
 
         let balance = Self::balance(env.clone(), from.clone());
         assert!(balance >= amount, "insufficient balance");
@@ -264,6 +297,9 @@ impl EmtToken {
 
         assert!(amount > 0, "amount must be positive");
 
+        Self::track_address(&env, &from);
+        Self::track_address(&env, &to);
+
         // Velocity check happens before balance mutation so a rejected
         // transfer doesn't leave stale state on the sender.
         Self::check_and_update_velocity(&env, &from, amount);
@@ -289,6 +325,9 @@ impl EmtToken {
         assert!(amount >= 0, "amount must be non-negative");
         assert!(from != spender, "self-approval is not allowed");
 
+        Self::track_address(&env, &from);
+        Self::track_allowance(&env, &from, &spender);
+
         Self::write_allowance(&env, from.clone(), spender.clone(), amount);
 
         env.events().publish((APPROVE,), (from, spender, amount));
@@ -305,6 +344,11 @@ impl EmtToken {
         Self::require_not_blocklisted(&env, &to);
 
         assert!(amount > 0, "amount must be positive");
+
+        Self::track_address(&env, &spender);
+        Self::track_address(&env, &from);
+        Self::track_address(&env, &to);
+        Self::track_allowance(&env, &from, &spender);
 
         // Velocity limit is charged against the `from` address (whose
         // balance is being spent), not the `spender` acting on its behalf.
@@ -340,6 +384,8 @@ impl EmtToken {
         Self::require_admin(&env);
 
         assert!(amount > 0, "amount must be positive");
+
+        Self::track_address(&env, &from);
 
         let balance = Self::balance(env.clone(), from.clone());
         assert!(balance >= amount, "insufficient balance");
@@ -382,6 +428,7 @@ impl EmtToken {
     /// Block `account` from sending or receiving tokens (MiCAR Art. 23).
     pub fn blocklist(env: Env, account: Address) {
         Self::require_blocklister(&env);
+        Self::track_address(&env, &account);
         Self::write_blocklist(&env, account.clone(), true);
         env.events().publish((BLOCKLIST,), (account, true));
     }
@@ -389,6 +436,7 @@ impl EmtToken {
     /// Remove `account` from the blocklist.
     pub fn unblocklist(env: Env, account: Address) {
         Self::require_blocklister(&env);
+        Self::track_address(&env, &account);
         Self::write_blocklist(&env, account.clone(), false);
         env.events().publish((BLOCKLIST,), (account, false));
     }
@@ -605,6 +653,65 @@ impl EmtToken {
             .extend_ttl(&key, 3_153_600, 6_312_000);
     }
 
+    // ── Tracked Address Book ────────────────────────────────────────────────
+    //
+    // Two persistent sets maintained alongside the Balance / Allowance /
+    // Blocklisted / VelocityLimit / VelocityState entries:
+    //
+    //   - TrackedAddresses: every Address that has written to one of the
+    //     address-keyed persistent entries above.
+    //   - TrackedAllowances: every (owner, spender) pair that has an
+    //     Allowance entry.
+    //
+    // These are used by `extend_storage_ttl` to enumerate the address
+    // space for batch TTL extension. Soroban persistent storage does not
+    // support iteration over its key space, so the contract must
+    // maintain an explicit address book to support retention. Membership
+    // is updated on every state-mutating call (the membership TTL itself
+    // is also bumped to the host ceiling so the book survives long idle
+    // periods).
+
+    /// Add `address` to the tracked-address book if not already present.
+    /// Bumps the book's TTL to the host ceiling ONLY when the membership
+    /// actually changes — a cache hit doesn't need the redundant
+    /// `extend_ttl`. The [`Self::extend_storage_ttl`] admin entry
+    /// refreshes the book explicitly so the idle case is covered.
+    fn track_address(env: &Env, address: &Address) {
+        let key = DataKey::TrackedAddresses;
+        let mut book: Map<Address, ()> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Map::new(env));
+        if !book.contains_key(address.clone()) {
+            book.set(address.clone(), ());
+            env.storage().persistent().set(&key, &book);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, 3_153_600, 6_312_000);
+        }
+    }
+
+    /// Add `(owner, spender)` to the tracked-allowance book if not already
+    /// present. Bumps the book's TTL to the host ceiling ONLY on
+    /// membership change (see [`Self::track_address`] for the rationale).
+    fn track_allowance(env: &Env, owner: &Address, spender: &Address) {
+        let key = DataKey::TrackedAllowances;
+        let mut book: Map<(Address, Address), ()> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Map::new(env));
+        let pair = (owner.clone(), spender.clone());
+        if !book.contains_key(pair.clone()) {
+            book.set(pair, ());
+            env.storage().persistent().set(&key, &book);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, 3_153_600, 6_312_000);
+        }
+    }
+
     // ── Velocity Limits (MiCAR Art. 46) ────────────────────────────────────
 
     /// Set the global default 24h outgoing-volume cap.
@@ -629,6 +736,7 @@ impl EmtToken {
     pub fn set_velocity_limit(env: Env, address: Address, limit: i128) {
         Self::require_admin(&env);
         assert!(limit >= 0, "limit must be non-negative");
+        Self::track_address(&env, &address);
         let key = DataKey::VelocityLimit(address);
         env.storage().persistent().set(&key, &limit);
         // Threshold ≈ 6 months, ceiling ≈ 1 year — chosen so the override
@@ -643,6 +751,7 @@ impl EmtToken {
     /// global default (admin only).
     pub fn clear_velocity_limit(env: Env, address: Address) {
         Self::require_admin(&env);
+        Self::track_address(&env, &address);
         env.storage()
             .persistent()
             .remove(&DataKey::VelocityLimit(address));
@@ -767,6 +876,134 @@ impl EmtToken {
             VEL_WINDOW_SIZE_LEDGERS + VEL_BUCKET_SIZE_LEDGERS,
         );
     }
+
+    // ── MiCAR Retention (admin-driven) ───────────────────────────────────────
+    //
+    // Soroban's host ceiling for a single `extend_ttl` call is
+    // `max_entry_ttl` = 6_312_000 ledgers ≈ 1 year at ~5 s/ledger. MiCAR
+    // Art. 23 / Art. 48 require retaining ecosystem-relevant state across
+    // the 5-year record-keeping window, so the on-chain retention must
+    // be periodically refreshed. This entry point batch-extends every
+    // Balance / Allowance / Blocklisted / VelocityLimit / VelocityState
+    // entry to the host ceiling, driven by an admin cron or governance
+    // action — making 5-year retention contract-internal instead of
+    // operationally-dependent on an out-of-band archiver.
+    //
+    // Auth: admin only. Pausable state is intentionally NOT consulted
+    // so the entry can be invoked during recovery (e.g., to keep a
+    // paused contract's records from being archived while an
+    // investigation is in progress).
+    //
+    // **Cost ceiling.** This call is O(N) over the tracked address +
+    // allowance books. At Soroban's default ~100M-instruction per-tx
+    // budget, a single call comfortably handles a few thousand entries;
+    // for larger books the admin cron should page the work across
+    // multiple transactions (e.g., by filtering the TrackedAddresses map
+    // off-chain and calling per-batch helpers, or simply by relying on
+    // the per-write TTL bump in `write_balance` / `write_allowance` /
+    // `write_blocklist` for actively-written entries).
+
+    /// Batch-extend TTL on every Balance, Allowance, Blocklisted,
+    /// VelocityLimit, and VelocityState entry to the host ceiling
+    /// (`max_entry_ttl` = 6_312_000 ledgers).
+    ///
+    /// Returns a [`TtlExtendResult`] with the count of address entries
+    /// and allowance-pair entries touched, useful for the calling cron /
+    /// governance action to log and detect drift over time.
+    ///
+    /// Emits `TTL_EXT(sequence, addresses_touched, allowance_pairs_touched)`
+    /// for off-chain indexers.
+    pub fn extend_storage_ttl(env: Env) -> TtlExtendResult {
+        Self::require_admin(&env);
+
+        let mut addresses_touched: u32 = 0;
+        let mut allowance_pairs_touched: u32 = 0;
+
+        // First refresh the tracking books themselves. If a book is
+        // archived, the whole retention guarantee collapses — the leaf
+        // entries would no longer be enumerated, but they'd still be on
+        // chain waiting to expire individually. The books are the index;
+        // keep them alive.
+        for book_key in [DataKey::TrackedAddresses, DataKey::TrackedAllowances].iter() {
+            if env.storage().persistent().has(book_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(book_key, 3_153_600, 6_312_000);
+            }
+        }
+
+        // Extend TTL for every tracked address.
+        if let Some(book) = env
+            .storage()
+            .persistent()
+            .get::<_, Map<Address, ()>>(&DataKey::TrackedAddresses)
+        {
+            let keys: Vec<Address> = book.keys();
+            for address in keys.iter() {
+                Self::extend_address_ttl(&env, &address);
+                addresses_touched += 1;
+            }
+        }
+
+        // Extend TTL for every tracked allowance pair.
+        if let Some(book) = env
+            .storage()
+            .persistent()
+            .get::<_, Map<(Address, Address), ()>>(&DataKey::TrackedAllowances)
+        {
+            let keys: Vec<(Address, Address)> = book.keys();
+            for (owner, spender) in keys.iter() {
+                Self::extend_allowance_ttl(&env, &owner, &spender);
+                allowance_pairs_touched += 1;
+            }
+        }
+
+        env.events().publish(
+            (TTL_EXT,),
+            (
+                env.ledger().sequence(),
+                addresses_touched,
+                allowance_pairs_touched,
+            ),
+        );
+
+        TtlExtendResult {
+            addresses_touched,
+            allowance_pairs_touched,
+        }
+    }
+
+    /// Extend TTL on every persistent entry keyed by `address`. Each
+    /// variant is independently checked for existence (e.g., an address
+    /// may have a Balance but no Blocklisted entry), so absent entries
+    /// are silently skipped — no panic, no error.
+    fn extend_address_ttl(env: &Env, address: &Address) {
+        for key in [
+            DataKey::Balance(address.clone()),
+            DataKey::Blocklisted(address.clone()),
+            DataKey::VelocityLimit(address.clone()),
+            DataKey::VelocityState(address.clone()),
+        ]
+        .iter()
+        {
+            if env.storage().persistent().has(key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(key, 3_153_600, 6_312_000);
+            }
+        }
+    }
+
+    /// Extend TTL on the (owner, spender) Allowance entry. Silently
+    /// skipped if no entry exists.
+    fn extend_allowance_ttl(env: &Env, owner: &Address, spender: &Address) {
+        let key = DataKey::Allowance(owner.clone(), spender.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, 3_153_600, 6_312_000);
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -774,7 +1011,8 @@ impl EmtToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::storage::Persistent;
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
     use soroban_sdk::{Env, String};
 
     fn setup() -> (
@@ -1162,5 +1400,162 @@ mod tests {
         client.transfer(&alice, &bob, &250_000_000);
         client.transfer(&alice, &bob, &250_000_000);
         assert_eq!(client.get_outflow_today(&alice), 500_000_000);
+    }
+
+    // ── extend_storage_ttl (MiCAR Art. 23 / Art. 48 retention) tests ────────
+
+    #[test]
+    fn test_extend_storage_ttl_no_op_on_fresh_contract() {
+        // A freshly initialised contract has no tracked addresses or
+        // allowances. extend_storage_ttl must succeed and report 0/0.
+        let (_env, _a, _m, _p, _b, client) = setup();
+        assert_eq!(
+            client.extend_storage_ttl(),
+            TtlExtendResult {
+                addresses_touched: 0,
+                allowance_pairs_touched: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_extend_storage_ttl_counts_writes() {
+        // After mint + transfer + approve, the address book should hold
+        // {alice, bob} (2 addresses) and the allowance book should hold
+        // {(alice, bob)} (1 pair). extend_storage_ttl must report those
+        // two counts and emit a `TTL_EXT` event with the same payload.
+        let (env, _a, _m, _p, _b, client) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        client.mint(&alice, &1_000_000);
+        client.transfer(&alice, &bob, &500_000);
+        client.approve(&alice, &bob, &250_000);
+
+        let result = client.extend_storage_ttl();
+        assert_eq!(
+            result,
+            TtlExtendResult {
+                addresses_touched: 2,
+                allowance_pairs_touched: 1,
+            }
+        );
+
+        // Verify the audit-trail event was published. The soroban-sdk
+        // `events().all()` returns `(contract, topics, data)` for every
+        // event from the last contract invocation. Our `TTL_EXT` event
+        // has a single-topic publish (`(TTL_EXT,)`), so we filter on
+        // topic count == 1 — enough to prove the event was emitted
+        // without coupling the test to the symbol's ScVal encoding.
+        let events = env.events().all();
+        assert!(
+            !events.is_empty(),
+            "expected at least one event to be published"
+        );
+        let last = events.last().expect("events vec is non-empty");
+        let (_contract, topics, _data) = last;
+        assert_eq!(
+            topics.len(),
+            1,
+            "TTL_EXT event should be published with exactly one topic"
+        );
+    }
+
+    #[test]
+    fn test_extend_storage_ttl_runs_when_paused() {
+        // Pausable state is intentionally NOT consulted by
+        // extend_storage_ttl so the entry can be invoked during recovery
+        // (e.g., to keep a paused contract's records from being archived
+        // while an investigation is in progress).
+        let (env, _a, _m, _p, _b, client) = setup();
+        let alice = Address::generate(&env);
+        client.mint(&alice, &1_000_000);
+        client.pause();
+        // Should not panic even though the contract is paused.
+        let result = client.extend_storage_ttl();
+        assert!(
+            result.addresses_touched >= 1 || result.allowance_pairs_touched >= 1,
+            "expected at least one entry to be touched"
+        );
+    }
+
+    #[test]
+    fn test_extend_storage_ttl_actually_bumps_ttl() {
+        // The whole point of `extend_storage_ttl` is to refresh entry
+        // TTLs. Verify that by reading the Balance and Allowance entries'
+        // remaining TTL before and after a batch extend across a ledger
+        // advance.
+        //
+        // Inlines its own setup so `contract_id` and `client` come from
+        // the *same* registration (the shared `setup()` helper does not
+        // currently expose `contract_id`, and re-registering a fresh
+        // contract would point `env.as_contract` at empty storage).
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmtToken);
+        let client = EmtTokenClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let minter = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let blocklister = Address::generate(&env);
+        client.initialize(&admin, &minter, &pauser, &blocklister);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        client.mint(&alice, &1_000_000);
+        client.approve(&alice, &bob, &500_000);
+
+        // Soroban's `extend_ttl(threshold, extend_to)` only fires when
+        // the entry's CURRENT TTL is below `threshold` (3_153_600 ledgers
+        // ≈ 6 months at ~5 s/ledger). So to observe an actual bump we
+        // must advance far enough that the entry's remaining TTL drops
+        // below that threshold. The leaf entries' live_until is
+        // `0 + 6_312_000` (set by `write_balance` / `write_allowance`),
+        // so the entry's TTL becomes `6_312_000 - current_ledger`. We
+        // need `6_312_000 - current_ledger < 3_153_600`, i.e.
+        // `current_ledger > 3_158_400`. We pick 5_000_000 (~290 days)
+        // for ample headroom.
+        let advance: u32 = 5_000_000;
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number.saturating_add(advance);
+        });
+
+        let balance_key = DataKey::Balance(alice.clone());
+        let allowance_key = DataKey::Allowance(alice.clone(), bob.clone());
+        let tracked_addr_key = DataKey::TrackedAddresses;
+        let tracked_allow_key = DataKey::TrackedAllowances;
+
+        let read_ttl = |key: &DataKey| -> u32 {
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(key))
+        };
+
+        let balance_ttl_before = read_ttl(&balance_key);
+        let allowance_ttl_before = read_ttl(&allowance_key);
+        let book_addr_ttl_before = read_ttl(&tracked_addr_key);
+        let book_allow_ttl_before = read_ttl(&tracked_allow_key);
+
+        // Sanity: the entries are not at the host ceiling anymore —
+        // they've lost exactly `advance` ledgers of TTL, putting each
+        // below the 3_153_600 threshold.
+        assert!(balance_ttl_before < 3_153_600);
+        assert!(allowance_ttl_before < 3_153_600);
+        assert!(book_addr_ttl_before < 3_153_600);
+        assert!(book_allow_ttl_before < 3_153_600);
+
+        let _count = client.extend_storage_ttl();
+
+        let balance_ttl_after = read_ttl(&balance_key);
+        let allowance_ttl_after = read_ttl(&allowance_key);
+        let book_addr_ttl_after = read_ttl(&tracked_addr_key);
+        let book_allow_ttl_after = read_ttl(&tracked_allow_key);
+
+        // After extend_ttl with extend_to=6_312_000 the remaining TTL
+        // should be at or very near the host ceiling.
+        assert!(balance_ttl_after >= 6_312_000 - 1);
+        assert!(allowance_ttl_after >= 6_312_000 - 1);
+        // The books' own TTLs are also bumped (otherwise the entire
+        // retention guarantee collapses once a book is archived).
+        assert!(book_addr_ttl_after >= 6_312_000 - 1);
+        assert!(book_allow_ttl_after >= 6_312_000 - 1);
     }
 }
