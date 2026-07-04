@@ -562,7 +562,7 @@ impl EmtToken {
         env.storage().persistent().set(&key, &balance);
         env.storage()
             .persistent()
-            .extend_ttl(&key, 3_153_600, 6_300_000);
+            .extend_ttl(&key, 3_153_600, 6_312_000);
     }
 
     /// Write `(owner, spender)`'s allowance to persistent storage and
@@ -570,7 +570,7 @@ impl EmtToken {
     ///
     /// Same hygiene rationale as [`Self::write_balance`]: an approval
     /// that's "live" should not silently expire. We extend to the
-    /// **host ceiling** (`max_entry_ttl` = 6_300_000 ledgers ≈ 1 year
+    /// **host ceiling** (`max_entry_ttl` = 6_312_000 ledgers ≈ 1 year
     /// at ~5 s/ledger) so the approval remains valid across delegations
     /// that span months — required by MiCAR Art. 23 / Art. 48
     /// record-keeping.
@@ -579,10 +579,9 @@ impl EmtToken {
         env.storage().persistent().set(&key, &amount);
         env.storage()
             .persistent()
-            .extend_ttl(&key, 3_153_600, 6_300_000);
+            .extend_ttl(&key, 3_153_600, 6_312_000);
     }
-
-    /// Write `account`'s blocklist flag and bump its TTL.
+    /// Write `account`'s blocklist flag and bump its TTL to the host ceiling.
     ///
     /// Same hygiene rationale as [`Self::write_balance`] and
     /// [`Self::write_allowance`]: without the `extend_ttl` follow-up, the
@@ -590,12 +589,20 @@ impl EmtToken {
     /// `min_persistent_entry_ttl` (4,096 ledgers ≈ 5.7 h at ~5 s/ledger).
     /// For a sanctions entry that's a MiCAR Art. 23 compliance fault — the
     /// address would silently "un-block" after a few hours of inactivity.
+    /// We extend to the same **host ceiling** as Balance/Allowance
+    /// (`max_entry_ttl` = 6_312_000 ledgers ≈ 1 year at ~5 s/ledger);
+    /// the retention *priority* for sanctions entries is enforced through
+    /// the audited admin path (`require_blocklister` + intent-only writes
+    /// via `blocklist`/`unblocklist`) rather than through a different
+    /// per-write ceiling. MiCAR Art. 23 / Art. 48 record-keeping still
+    /// requires the same admin-cron / external archiver pattern documented
+    /// on [`Self::write_balance`].
     fn write_blocklist(env: &Env, account: Address, blocked: bool) {
         let key = DataKey::Blocklisted(account);
         env.storage().persistent().set(&key, &blocked);
         env.storage()
             .persistent()
-            .extend_ttl(&key, 3_153_600, 6_300_000);
+            .extend_ttl(&key, 3_153_600, 6_312_000);
     }
 
     // ── Velocity Limits (MiCAR Art. 46) ────────────────────────────────────
