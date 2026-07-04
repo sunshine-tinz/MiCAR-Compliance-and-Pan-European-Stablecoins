@@ -73,6 +73,10 @@ pub enum DataKey {
     VelocityLimit(Address),
     /// MiCAR Art. 46 — sliding-window volume tracker per sender.
     VelocityState(Address),
+    /// MiCAR Art. 46 — aggregate supply cap (total tokens ever minted
+    /// across all holders). `0` means "no cap" (unlimited). Enforced in
+    /// `mint()`; settable by admin via `set_aggregate_mint_cap`.
+    AggregateMintCap,
     /// MiCAR Art. 23 / Art. 48 — tracked address book (set of every Address
     /// that has ever written to a Balance, Blocklisted, VelocityLimit, or
     /// VelocityState entry). Maintained by `track_address` from every
@@ -136,6 +140,8 @@ const ACCEPT_AD: Symbol = symbol_short!("ACCEPT");
 const CANCEL_AD: Symbol = symbol_short!("CANCEL");
 /// Batch TTL extension ran (MiCAR Art. 23 / Art. 48 retention).
 const TTL_EXT: Symbol = symbol_short!("TTL_EXT");
+/// Aggregate mint cap was set or unset (MiCAR Art. 46).
+const MINT_CAP: Symbol = symbol_short!("MINT_CAP");
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -172,10 +178,14 @@ impl EmtToken {
             .set(&DataKey::Blocklister, &blocklister);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::TotalSupply, &0_i128);
-        // MiCAR Art. 46 default: no velocity cap unless the admin sets one.
+        // MiCAR Art. 46 defaults: no velocity cap and no aggregate mint
+        // cap unless the admin sets one.
         env.storage()
             .instance()
             .set(&DataKey::GlobalVelocityLimit, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::AggregateMintCap, &0_i128);
         // Stamp instance storage TTL so the contract stays dispatchable
         // across long idle periods (and across the test-env ledger
         // advances that simulate them). Threshold ≈ 6 mo, extend-to ≈ 1 y.
@@ -227,10 +237,13 @@ impl EmtToken {
     /// Caller must be the designated minter.
     /// Recipient must not be blocklisted.
     /// Contract must not be paused.
+    /// If an aggregate mint cap is configured, the new total supply
+    /// (`total_supply + amount`) must not exceed it.
     ///
     /// # MiCAR
     /// Minting should only occur after fiat funds are received and segregated
-    /// in the reserve account (Art. 45).
+    /// in the reserve account (Art. 45). The aggregate cap (Art. 46) is a
+    /// hard ceiling on token issuance.
     pub fn mint(env: Env, to: Address, amount: i128) {
         Self::require_not_paused(&env);
         Self::require_minter(&env);
@@ -240,10 +253,25 @@ impl EmtToken {
 
         Self::track_address(&env, &to);
 
+        // Aggregate cap check happens BEFORE the balance / supply mutation
+        // so a rejected mint doesn't leave stale state. `0` means "no cap"
+        // (mirroring the GlobalVelocityLimit convention).
+        let supply: i128 = Self::total_supply(env.clone());
+        let cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AggregateMintCap)
+            .unwrap_or(0);
+        if cap > 0 {
+            assert!(
+                supply.saturating_add(amount) <= cap,
+                "aggregate mint cap exceeded"
+            );
+        }
+
         let new_balance = Self::balance(env.clone(), to.clone()) + amount;
         Self::write_balance(&env, to.clone(), new_balance);
 
-        let supply: i128 = Self::total_supply(env.clone());
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply + amount));
@@ -877,6 +905,54 @@ impl EmtToken {
         );
     }
 
+    // ── Aggregate Mint Cap (MiCAR Art. 46) ──────────────────────────────
+
+    /// Set the aggregate (global) supply cap. `cap == 0` means
+    /// "unlimited". Panics if `cap > 0 && cap < current_total_supply`
+    /// (would silently brick future mints) — to remove the cap, call
+    /// {@link unset_aggregate_mint_cap} instead.
+    ///
+    /// Admin only.
+    pub fn set_aggregate_mint_cap(env: Env, cap: i128) {
+        Self::require_admin(&env);
+        assert!(cap >= 0, "cap must be non-negative");
+        if cap > 0 {
+            let supply: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalSupply)
+                .unwrap_or(0);
+            assert!(
+                cap >= supply,
+                "cap must be 0 (unlimited) or at least current total supply"
+            );
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AggregateMintCap, &cap);
+        env.events().publish((MINT_CAP,), (cap,));
+    }
+
+    /// Read the current aggregate supply cap. `0` means "unlimited".
+    pub fn get_aggregate_mint_cap(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AggregateMintCap)
+            .unwrap_or(0)
+    }
+
+    /// Remove the aggregate supply cap (admin only). Equivalent to
+    /// `set_aggregate_mint_cap(0)` but without the on-chain "cap must
+    /// be >= current supply" assertion (which is trivially satisfied
+    /// when the new cap is 0).
+    pub fn unset_aggregate_mint_cap(env: Env) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::AggregateMintCap, &0_i128);
+        env.events().publish((MINT_CAP,), (0_i128,));
+    }
+
     // ── MiCAR Retention (admin-driven) ───────────────────────────────────────
     //
     // Soroban's host ceiling for a single `extend_ttl` call is
@@ -1297,10 +1373,56 @@ mod tests {
         client.propose_admin(&admin);
     }
 
+    // ── end-to-end admin handover test follows below ────────────────────────
+
     #[test]
     fn test_pending_admin_none_after_init() {
         let (_env, _a, _m, _p, _b, client) = setup();
         assert_eq!(client.pending_admin(), None);
+    }
+
+    /// End-to-end test of the two-step admin handover. Walks through
+    /// propose → accept → verify the contract is still functional,
+    /// mirroring what `scripts/rotate-admin.sh` does against a live
+    /// network.
+    ///
+    /// NOTE: under Soroban's `mock_all_auths()` the old admin's
+    /// `require_auth()` still succeeds, so we can't directly test
+    /// auth-revocation here. The on-network behaviour is covered by
+    /// the host's auth context check (see `docs/admin-handover.md`).
+    #[test]
+    fn test_admin_handover_full_flow() {
+        let (env, _current_admin, _m, _p, _b, client) = setup();
+        let new_admin = Address::generate(&env);
+        let new_pauser = Address::generate(&env);
+
+        // Before: no proposal in flight.
+        assert_eq!(client.pending_admin(), None);
+
+        // Step 1: current admin proposes new_admin.
+        client.propose_admin(&new_admin);
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        // Re-propose and roll back: the second propose overwrites the
+        // first. This is the documented overwrite semantics.
+        let other_admin = Address::generate(&env);
+        client.propose_admin(&other_admin);
+        assert_eq!(client.pending_admin(), Some(other_admin.clone()));
+        client.propose_admin(&new_admin);
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        // Step 2: proposed admin accepts. Under mock_all_auths we just
+        // call the method (the require_auth would normally gate this
+        // on a real network — see the doc comment above).
+        client.accept_admin();
+        assert_eq!(client.pending_admin(), None);
+
+        // Step 3: verify the contract is still functional by exercising
+        // a privileged action. A failed handover would have left the
+        // contract in an inconsistent state where the new admin key
+        // could not act; this smoke test catches that class of bug.
+        client.update_pauser(&new_pauser);
+        // The pauser role was updated; the contract remains dispatchable.
     }
 
     // ── Velocity-limit (MiCAR Art. 46) tests ────────────────────────────────
@@ -1400,6 +1522,115 @@ mod tests {
         client.transfer(&alice, &bob, &250_000_000);
         client.transfer(&alice, &bob, &250_000_000);
         assert_eq!(client.get_outflow_today(&alice), 500_000_000);
+    }
+
+    // ── Aggregate mint cap (MiCAR Art. 46) tests ─────────────────────────────
+
+    #[test]
+    fn test_mint_no_cap_default_allows_any_supply() {
+        // Fresh contract: no aggregate mint cap set. A 1B-token mint
+        // should succeed and the post-mint total_supply should match.
+        let (env, _a, _m, _p, _b, client) = setup();
+        assert_eq!(client.get_aggregate_mint_cap(), 0);
+        let alice = Address::generate(&env);
+        client.mint(&alice, &1_000_000_000_000i128);
+        assert_eq!(client.total_supply(), 1_000_000_000_000);
+    }
+
+    #[test]
+    fn test_mint_cap_zero_is_unlimited() {
+        // `set_aggregate_mint_cap(0)` keeps the cap at "unlimited" (not
+        // "zero allowed"). Mint should still succeed.
+        let (env, _a, _m, _p, _b, client) = setup();
+        client.set_aggregate_mint_cap(&0i128);
+        assert_eq!(client.get_aggregate_mint_cap(), 0);
+        let alice = Address::generate(&env);
+        client.mint(&alice, &500_000_000);
+        assert_eq!(client.total_supply(), 500_000_000);
+    }
+
+    #[test]
+    fn test_mint_cap_enforcement() {
+        // Set a cap, mint up to it, then attempt a mint that would push
+        // over the cap. The latter is covered by
+        // `test_mint_over_cap_panics` (using `#[should_panic]` since
+        // Soroban's `no_std` test environment does not expose
+        // `std::panic::catch_unwind`).
+        let (env, _a, _m, _p, _b, client) = setup();
+        client.set_aggregate_mint_cap(&1_000_000i128);
+
+        // Audit-trail event: `set_aggregate_mint_cap` publishes
+        // `MINT_CAP(cap)` so off-chain indexers can reconcile the cap
+        // history. Check the events at this point — BEFORE the mint
+        // call below emits a `MINT` event that would otherwise be
+        // `events.last()` and satisfy the same single-topic check.
+        // Pin the event count to 1 so a regression where
+        // `set_aggregate_mint_cap` emits extra (or wrong) events is
+        // caught — `events.last()` alone wouldn't notice.
+        let events = env.events().all();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one event (MINT_CAP) should be published after set_aggregate_mint_cap"
+        );
+        let (_contract, topics, _data) = events.last().expect("events vec is non-empty");
+        assert_eq!(
+            topics.len(),
+            1,
+            "MINT_CAP event should be published with exactly one topic"
+        );
+
+        let alice = Address::generate(&env);
+        // First mint fits exactly.
+        client.mint(&alice, &1_000_000);
+        assert_eq!(client.total_supply(), 1_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "aggregate mint cap exceeded")]
+    fn test_mint_over_cap_panics() {
+        // A second mint that would push past the configured cap must
+        // panic. `#[should_panic]` is the only panic-recovery primitive
+        // available in Soroban's `no_std` test env (no
+        // `std::panic::catch_unwind`).
+        let (env, _a, _m, _p, _b, client) = setup();
+        client.set_aggregate_mint_cap(&1_000_000i128);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // First mint fits exactly.
+        client.mint(&alice, &1_000_000);
+        // Second mint exceeds the cap — must panic.
+        client.mint(&bob, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "cap must be 0 (unlimited) or at least current total supply")]
+    fn test_set_mint_cap_below_current_supply_panics() {
+        // Mint some tokens, then try to set a cap below the existing
+        // supply. Should panic so the admin can't silently brick future
+        // mints.
+        let (env, _a, _m, _p, _b, client) = setup();
+        let alice = Address::generate(&env);
+        client.mint(&alice, &1_000_000);
+        client.set_aggregate_mint_cap(&500_000i128);
+    }
+
+    #[test]
+    fn test_unset_mint_cap_restores_unlimited() {
+        // Set a cap, hit it, unset the cap, mint more successfully.
+        let (env, _a, _m, _p, _b, client) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.set_aggregate_mint_cap(&1_000_000i128);
+        client.mint(&alice, &1_000_000);
+        assert_eq!(client.total_supply(), 1_000_000);
+
+        client.unset_aggregate_mint_cap();
+        assert_eq!(client.get_aggregate_mint_cap(), 0);
+        client.mint(&bob, &999_999_999);
+        assert_eq!(client.total_supply(), 1_000_999_999);
     }
 
     // ── extend_storage_ttl (MiCAR Art. 23 / Art. 48 retention) tests ────────

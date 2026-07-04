@@ -467,6 +467,46 @@ export class EmtClient {
     );
   }
 
+  // ── Aggregate Mint Cap (MiCAR Art. 46) ────────────────────────────────────
+
+  /**
+   * Set the aggregate supply cap (admin). `0n` disables the cap
+   * (unlimited). Panics on-chain if `cap < current_total_supply` —
+   * `setAggregateMintCap(0n)` is a safe way to "uncap" without that
+   * pre-check, via {@link unsetAggregateMintCap}.
+   */
+  async setAggregateMintCap(args: {
+    cap: bigint;
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite(
+      [this.i128Arg(args.cap)],
+      args.sourceKeypair,
+      "set_aggregate_mint_cap"
+    );
+  }
+
+  /**
+   * Read the current aggregate supply cap. `0n` means "no cap".
+   */
+  async getAggregateMintCap(): Promise<bigint> {
+    return toBigInt(
+      await this.simulateView("get_aggregate_mint_cap", [])
+    );
+  }
+
+  /**
+   * Remove the aggregate supply cap (admin). Equivalent to
+   * `setAggregateMintCap(0n)` but without the on-chain "cap must be
+   * zero or >= current total supply" assertion (which is trivially
+   * satisfied when the new cap is 0).
+   */
+  async unsetAggregateMintCap(args: {
+    sourceKeypair: Keypair;
+  }): Promise<SubmitResult> {
+    return this.invokeWrite([], args.sourceKeypair, "unset_aggregate_mint_cap");
+  }
+
   // ── MiCAR Retention (admin-driven) ───────────────────────────────────────
 
   /**
