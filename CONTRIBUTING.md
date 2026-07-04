@@ -78,7 +78,7 @@ impact. Each maps to a GitHub issue.
 | Two-step admin transfer | Propose + accept pattern for admin role handover ✅ shipped | Medium |
 | Extend-storage TTL entry point | `extend_storage_ttl` admin entry to batch-refresh persistent entry TTLs to the host ceiling for MiCAR Art. 23 / 48 5-year retention ✅ shipped | High |
 | Lazy-prune tracking books | Drop addresses from `TrackedAddresses` / `TrackedAllowances` once their balance has been zero for an extended period and they have no other persistent state, to keep the books bounded over the contract's lifetime | Medium |
-| Mint supply cap | Aggregate supply limit enforced in `mint()` | Trivial |
+| Mint supply cap | Aggregate supply limit enforced in `mint()` ✅ shipped | Trivial |
 | Oracle integration | `mint()` checks oracle before proceeding | High |
 | Clawback policy | Define whether clawback burns or credits admin | Trivial |
 | Attestation expiry | Reject stale attestations in oracle_interface | Medium |
@@ -102,19 +102,19 @@ impact. Each maps to a GitHub issue.
 
 | Issue | Description | Complexity |
 |---|---|---|
-| Server skeleton | Express server with `POST /tx-approve` | Medium |
-| KYC check stub | Interface for plugging in a KYC provider | Medium |
-| Sanctions screening | Stub + interface for sanctions API | Medium |
-| Transaction limits | Read limits from `emt_token` contract | High |
-| Travel rule | Collect and forward data for > €1,000 transfers | High |
-| Docker config | Containerise the hook server | Trivial |
-| Integration tests | Test against local Stellar testnet | High |
+| Server skeleton | Express server with `POST /tx-approve` ✅ shipped (`scripts/sep0008-server/`) | Medium |
+| KYC check stub | Interface for plugging in a KYC provider ✅ shipped (interface + mock) | Medium |
+| Sanctions screening | Stub + interface for sanctions API ✅ shipped (interface + mock) | Medium |
+| Transaction limits | Read limits from `emt_token` contract (mock shipped; on-chain read via SDK is the next step) | High |
+| Travel rule | Collect and forward data for > €1,000 transfers (interface + mock shipped; real provider integration pending) | High |
+| Docker config | Containerise the hook server ✅ shipped | Trivial |
+| Integration tests | Test against local Stellar testnet (mock-mode Jest suite ships; testnet integration is the next step) | High |
 
 ### Documentation
 
 | Issue | Description | Complexity |
 |---|---|---|
-| OpenAPI spec | Document the hook server API | Medium |
+| OpenAPI spec | Document the hook server API ✅ shipped (full HTTP spec in [`docs/sep0008-hook.md`](docs/sep0008-hook.md) §2–§3, with error code catalog) | Medium |
 | Deployment guide | Step-by-step mainnet deployment | Medium |
 | Audit checklist | Pre-launch security checklist | Medium |
 

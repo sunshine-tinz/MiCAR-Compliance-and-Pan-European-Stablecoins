@@ -155,6 +155,7 @@ A mainnet deployment is refused unless `I_UNDERSTAND_MAINNET=1` is set.
 | Art. 23 | AML/CFT controls | `blocklist` + SEP-0008 hook + reserve oracle |
 | Art. 22 | Travel rule (> €1,000) | Hook server (off-chain) — _see `sep0008-hook.md`_ |
 | Art. 46 | Transaction limits | Per-address 24h velocity limit (two-bucket sliding window) + global default |
+| Art. 46 | Aggregate mint cap | `emt_token::set_aggregate_mint_cap` (admin) enforces a hard ceiling on `total_supply` in `mint()`. `0` means unlimited; `unset_aggregate_mint_cap` removes the cap. Refuses to set a cap below the current supply. |
 | Art. 23 / 48 | 5-year record retention | `emt_token::extend_storage_ttl` (admin cron / governance) batch-extends every Balance / Allowance / Blocklisted / VelocityLimit / VelocityState entry plus the tracking books to the host ceiling. Per-write TTL bumps on every state mutation; periodic batch refresh is the contract-internal complement. |
 | Art. 35 | Issuer authorisation | _Legal obligation — enforced outside the smart contracts_ |
 
@@ -172,10 +173,9 @@ Read [`docs/micar-compliance.md`](docs/micar-compliance.md) for the full mapping
 
 Things explicitly **not** done yet (see [`CONTRIBUTING.md`](CONTRIBUTING.md)):
 
-- Aggregated supply cap enforced in `mint()` (MiCAR Art. 46)
 - Lazy-prune `TrackedAddresses` / `TrackedAllowances` (drop addresses with zero balance and no other state to keep the books bounded as the contract's lifetime grows)
 - Fuzz / property-based tests
-- The actual off-chain SEP-0008 hook server (Node.js/TypeScript)
+- Real KYC / sanctions / travel-rule provider clients in the SEP-0008 hook server (the skeleton ships mock providers; the integration interfaces are in place)
 
 ---
 
@@ -197,6 +197,7 @@ server specification and the proposed OpenAPI surface.
 - [`docs/micar-compliance.md`](docs/micar-compliance.md) — per-article
   obligation mapping
 - [`docs/sep0008-hook.md`](docs/sep0008-hook.md) — off-chain hook server
+- [`docs/admin-handover.md`](docs/admin-handover.md) — two-step admin rotation runbook
 - [`sdk/README.md`](sdk/README.md) — SDK reference
 - [`SECURITY.md`](SECURITY.md) — disclosure policy
 - [`.env.example`](.env.example) — environment template
