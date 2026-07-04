@@ -1,0 +1,34 @@
+# lefthook.yml — local pre-commit + pre-push gate.
+#
+# Runs `scripts/verify.sh` before each commit and each push. That
+# script mirrors `.github/workflows/ci.yml` (cargo fmt + clippy +
+# test on the Rust contracts, `npm ci || npm install` + `npm run
+# build` + `npm test` on the SDK). A non-zero exit aborts the
+# commit or the push, exactly the way the CI gate would.
+#
+# Install lefthook once on your machine:
+#   brew install lefthook                 # macOS / Linuxbrew
+#   cargo install lefthook                # any platform with cargo
+#   npm install -g @evilmartians/lefthook # Node-based install
+#
+# Then `lefthook install` once per clone — lefthook does NOT auto-wire
+# hooks just from being on PATH. Run the gate manually at any time:
+#   lefthook run pre-commit
+#   lefthook run pre-push
+# Bypass (git-level, not lefthook):
+#   git commit --no-verify   # skip the pre-commit gate
+#   git push   --no-verify   # skip the pre-push gate
+#
+# Why lefthook over a plain `core.hooksPath` script: declarative YAML
+# and works equally well for contributors who only touch contracts vs.
+# only touch the SDK. Why not husky: husky ties hooks to npm install in
+# sdk/, which is asymmetric for a Rust-first contributor.
+
+pre-commit:
+  commands:
+    verify:
+      run: scripts/verify.sh
+pre-push:
+  commands:
+    verify:
+      run: scripts/verify.sh
