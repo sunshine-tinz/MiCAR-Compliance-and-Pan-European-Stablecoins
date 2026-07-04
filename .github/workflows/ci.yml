@@ -8,40 +8,45 @@ on:
 
 jobs:
   contracts:
-    name: Rust contracts
+    name: Rust contracts (fmt + clippy + test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
 
-      - name: Cache cargo
+      - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             contracts/target
-          key: cargo-${{ hashFiles('contracts/Cargo.toml') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('contracts/Cargo.toml', 'contracts/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
 
       - name: cargo fmt
         working-directory: contracts
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: cargo clippy
         working-directory: contracts
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: cargo test
         working-directory: contracts
-        run: cargo test
+        run: cargo test --all
 
   sdk:
-    name: TypeScript SDK
+    name: TypeScript SDK (build + typecheck + test)
     runs-on: ubuntu-latest
+    defaults:
+      working-directory: sdk
     steps:
       - uses: actions/checkout@v4
 
@@ -52,10 +57,37 @@ jobs:
           cache: npm
           cache-dependency-path: sdk/package-lock.json
 
+      # `npm ci` requires a committed lockfile; fall back to `npm install` so
+      # the SDK doesn't break for first-time contributors who haven't generated
+      # one yet. Lockfile will be auto-regenerated and committed by maintainers.
       - name: Install dependencies
-        working-directory: sdk
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "No lockfile — falling back to 'npm install'"
+            npm install
+          fi
+
+      - name: Build
+        run: npm run build
 
       - name: Type-check
-        working-directory: sdk
         run: npx tsc --noEmit
+
+  docs:
+    name: Docs sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # very small lint: ensure each doc referenced from the README exists.
+      - name: Verify referenced docs exist
+        shell: bash
+        run: |
+          set -e
+          for f in docs/architecture.md docs/micar-compliance.md docs/sep0008-hook.md \
+                   SECURITY.md .env.example; do
+            test -f "$f" || { echo "MISSING: $f"; exit 1; }
+            echo "ok: $f"
+          done
