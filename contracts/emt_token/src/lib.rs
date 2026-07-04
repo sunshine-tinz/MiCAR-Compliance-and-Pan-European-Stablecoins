@@ -210,9 +210,7 @@ impl EmtToken {
         assert!(amount > 0, "amount must be positive");
 
         let new_balance = Self::balance(env.clone(), to.clone()) + amount;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to.clone()), &new_balance);
+        Self::write_balance(&env, to.clone(), new_balance);
 
         let supply: i128 = Self::total_supply(env.clone());
         env.storage()
@@ -238,9 +236,7 @@ impl EmtToken {
         let balance = Self::balance(env.clone(), from.clone());
         assert!(balance >= amount, "insufficient balance");
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(from.clone()), &(balance - amount));
+        Self::write_balance(&env, from.clone(), balance - amount);
 
         let supply: i128 = Self::total_supply(env.clone());
         env.storage()
@@ -275,14 +271,10 @@ impl EmtToken {
         let from_balance = Self::balance(env.clone(), from.clone());
         assert!(from_balance >= amount, "insufficient balance");
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
+        Self::write_balance(&env, from.clone(), from_balance - amount);
 
         let to_balance = Self::balance(env.clone(), to.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+        Self::write_balance(&env, to.clone(), to_balance + amount);
 
         env.events().publish((TRANSFER,), (from, to, amount));
     }
@@ -297,9 +289,7 @@ impl EmtToken {
         assert!(amount >= 0, "amount must be non-negative");
         assert!(from != spender, "self-approval is not allowed");
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(from.clone(), spender.clone()), &amount);
+        Self::write_allowance(&env, from.clone(), spender.clone(), amount);
 
         env.events().publish((APPROVE,), (from, spender, amount));
     }
@@ -326,19 +316,12 @@ impl EmtToken {
         let from_balance = Self::balance(env.clone(), from.clone());
         assert!(from_balance >= amount, "insufficient balance");
 
-        env.storage().persistent().set(
-            &DataKey::Allowance(from.clone(), spender.clone()),
-            &(allowance - amount),
-        );
+        Self::write_allowance(&env, from.clone(), spender.clone(), allowance - amount);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
+        Self::write_balance(&env, from.clone(), from_balance - amount);
 
         let to_balance = Self::balance(env.clone(), to.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+        Self::write_balance(&env, to.clone(), to_balance + amount);
 
         env.events().publish((TRANSFER,), (from, to, amount));
     }
@@ -361,9 +344,7 @@ impl EmtToken {
         let balance = Self::balance(env.clone(), from.clone());
         assert!(balance >= amount, "insufficient balance");
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(from.clone()), &(balance - amount));
+        Self::write_balance(&env, from.clone(), balance - amount);
 
         let supply: i128 = Self::total_supply(env.clone());
         env.storage()
@@ -564,6 +545,33 @@ impl EmtToken {
         assert!(!blocked, "account is blocklisted");
     }
 
+    /// Write `account`'s balance to persistent storage and bump its TTL.
+    ///
+    /// Soroban's persistent entries become eligible for archiving once
+    /// their TTL falls below `min_persistent_entry_ttl` (4096 ledgers ≈
+    /// 5.7 h at ~5 s/ledger). For a long-lived account balance we want
+    /// the entry to survive any reasonable idle period AND any
+    /// simulated ledger advance. Threshold ≈ 6 months, extend-to ≈ 1
+    /// year — chosen so the balance never silently disappears.
+    fn write_balance(env: &Env, account: Address, balance: i128) {
+        let key = DataKey::Balance(account);
+        env.storage().persistent().set(&key, &balance);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 3_153_600, 6_300_000);
+    }
+
+    /// Write `(owner, spender)`'s allowance to persistent storage and
+    /// bump its TTL. Same rationale as [`Self::write_balance`]: an
+    /// approval that's "live" should not silently expire.
+    fn write_allowance(env: &Env, owner: Address, spender: Address, amount: i128) {
+        let key = DataKey::Allowance(owner, spender);
+        env.storage().persistent().set(&key, &amount);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 3_153_600, 6_300_000);
+    }
+
     // ── Velocity Limits (MiCAR Art. 46) ────────────────────────────────────
 
     /// Set the global default 24h outgoing-volume cap.
@@ -674,9 +682,6 @@ impl EmtToken {
 
     fn check_and_update_velocity(env: &Env, from: &Address, amount: i128) {
         let limit = Self::effective_velocity_limit(env, from);
-        if limit == 0 {
-            return; // unbounded
-        }
 
         let now = env.ledger().sequence();
         let bucket_start = (now / VEL_BUCKET_SIZE_LEDGERS) * VEL_BUCKET_SIZE_LEDGERS;
@@ -707,7 +712,14 @@ impl EmtToken {
         let prev_contribution =
             (state.previous * prev_weight_numer) / VEL_BUCKET_SIZE_LEDGERS as i128;
         let projected = prev_contribution + state.current + amount;
-        assert!(projected <= limit, "velocity limit exceeded");
+        // Cap enforcement is **only** triggered when a non-zero limit
+        // is configured (global or per-address). When the limit is 0
+        // (unlimited), the velocity state still updates so that
+        // `outflow_at` and `get_outflow_today` return the actual
+        // accumulated volume for unbounded addresses.
+        if limit > 0 {
+            assert!(projected <= limit, "velocity limit exceeded");
+        }
 
         state.current += amount;
         let key = DataKey::VelocityState(from.clone());
@@ -915,9 +927,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "already initialized")]
     fn test_double_initialize_blocked() {
-        let (env, admin, minter, pauser, blocklister, _client) = setup();
-        let contract_id = env.register_contract(None, EmtToken);
-        let client = EmtTokenClient::new(&env, &contract_id);
+        let (_env, admin, minter, pauser, blocklister, client) = setup();
+        // Re-using the already-initialized `client` from `setup()` —
+        // registering a fresh contract here would yield a NEW contract
+        // id with empty storage, where `initialize` would succeed and
+        // not panic.
         client.initialize(&admin, &minter, &pauser, &blocklister);
     }
 
@@ -1090,7 +1104,9 @@ mod tests {
     #[test]
     fn test_transfer_from_is_velocity_gated() {
         let (env, _a, _m, _p, _b, client) = setup();
-        client.set_global_velocity_limit(&50_000_000i128);
+        // 100M cap so 30M + 30M = 60M cumulative fits; the test asserts
+        // both transfers succeed AND that outflow_today reads 60M.
+        client.set_global_velocity_limit(&100_000_000i128);
 
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);

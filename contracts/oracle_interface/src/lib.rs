@@ -448,9 +448,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "already initialized")]
     fn test_double_initialize_blocked() {
-        let (env, admin, _, _) = setup();
-        let contract_id = env.register_contract(None, OracleInterface);
-        let client = OracleInterfaceClient::new(&env, &contract_id);
+        let (_env, admin, _, client) = setup();
+        // Re-use the already-initialized `client` from `setup()` —
+        // registering a fresh contract here would yield a NEW contract
+        // id with empty storage, where `initialize` would succeed and
+        // not panic.
         client.initialize(&admin);
     }
 
