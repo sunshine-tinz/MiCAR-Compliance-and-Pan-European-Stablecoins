@@ -382,18 +382,14 @@ impl EmtToken {
     /// Block `account` from sending or receiving tokens (MiCAR Art. 23).
     pub fn blocklist(env: Env, account: Address) {
         Self::require_blocklister(&env);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Blocklisted(account.clone()), &true);
+        Self::write_blocklist(&env, account.clone(), true);
         env.events().publish((BLOCKLIST,), (account, true));
     }
 
     /// Remove `account` from the blocklist.
     pub fn unblocklist(env: Env, account: Address) {
         Self::require_blocklister(&env);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Blocklisted(account.clone()), &false);
+        Self::write_blocklist(&env, account.clone(), false);
         env.events().publish((BLOCKLIST,), (account, false));
     }
 
@@ -545,14 +541,22 @@ impl EmtToken {
         assert!(!blocked, "account is blocklisted");
     }
 
-    /// Write `account`'s balance to persistent storage and bump its TTL.
+    /// Write `account`'s balance to persistent storage and bump its TTL
+    /// to the host ceiling.
     ///
     /// Soroban's persistent entries become eligible for archiving once
-    /// their TTL falls below `min_persistent_entry_ttl` (4096 ledgers ≈
+    /// their TTL falls below `min_persistent_entry_ttl` (4,096 ledgers ≈
     /// 5.7 h at ~5 s/ledger). For a long-lived account balance we want
     /// the entry to survive any reasonable idle period AND any
-    /// simulated ledger advance. Threshold ≈ 6 months, extend-to ≈ 1
-    /// year — chosen so the balance never silently disappears.
+    /// simulated ledger advance. Threshold ≈ 6 months; extend-to at the
+    /// **host ceiling** (`max_entry_ttl` = 6_312_000 ledgers ≈ 1 year at
+    /// ~5 s/ledger) — chosen so the balance contributes the maximum
+    /// per-write retention the host allows. MiCAR Art. 23 / Art. 48
+    /// require retaining ecosystem-relevant state across the
+    /// 5-year record-keeping window; that window is satisfied by an
+    /// admin cron (or external archival layer) periodically
+    /// re-extending entries to the ceiling — this `extend_ttl` call
+    /// maximises each write's contribution to that retention.
     fn write_balance(env: &Env, account: Address, balance: i128) {
         let key = DataKey::Balance(account);
         env.storage().persistent().set(&key, &balance);
@@ -562,11 +566,33 @@ impl EmtToken {
     }
 
     /// Write `(owner, spender)`'s allowance to persistent storage and
-    /// bump its TTL. Same rationale as [`Self::write_balance`]: an
-    /// approval that's "live" should not silently expire.
+    /// bump its TTL to the host ceiling.
+    ///
+    /// Same hygiene rationale as [`Self::write_balance`]: an approval
+    /// that's "live" should not silently expire. We extend to the
+    /// **host ceiling** (`max_entry_ttl` = 6_300_000 ledgers ≈ 1 year
+    /// at ~5 s/ledger) so the approval remains valid across delegations
+    /// that span months — required by MiCAR Art. 23 / Art. 48
+    /// record-keeping.
     fn write_allowance(env: &Env, owner: Address, spender: Address, amount: i128) {
         let key = DataKey::Allowance(owner, spender);
         env.storage().persistent().set(&key, &amount);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 3_153_600, 6_300_000);
+    }
+
+    /// Write `account`'s blocklist flag and bump its TTL.
+    ///
+    /// Same hygiene rationale as [`Self::write_balance`] and
+    /// [`Self::write_allowance`]: without the `extend_ttl` follow-up, the
+    /// entry would be eligible for archiving once its TTL falls below
+    /// `min_persistent_entry_ttl` (4,096 ledgers ≈ 5.7 h at ~5 s/ledger).
+    /// For a sanctions entry that's a MiCAR Art. 23 compliance fault — the
+    /// address would silently "un-block" after a few hours of inactivity.
+    fn write_blocklist(env: &Env, account: Address, blocked: bool) {
+        let key = DataKey::Blocklisted(account);
+        env.storage().persistent().set(&key, &blocked);
         env.storage()
             .persistent()
             .extend_ttl(&key, 3_153_600, 6_300_000);
