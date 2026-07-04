@@ -32,12 +32,12 @@
     ],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "burn",
+              "function_name": "clawback",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -45,7 +45,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 4000000
+                    "lo": 3000000
                   }
                 }
               ]
@@ -106,7 +106,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 6000000
+                    "lo": 7000000
                   }
                 }
               }
@@ -225,7 +225,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 6000000
+                            "lo": 7000000
                           }
                         }
                       }
@@ -237,6 +237,39 @@
             "ext": "v0"
           },
           6300000
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "ledger_key_nonce": {
+                "nonce": 5541220902715666415
+              }
+            },
+            "durability": "temporary"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "ledger_key_nonce": {
+                    "nonce": 5541220902715666415
+                  }
+                },
+                "durability": "temporary",
+                "val": "void"
+              }
+            },
+            "ext": "v0"
+          },
+          6311999
         ]
       ],
       [
@@ -261,39 +294,6 @@
                 "key": {
                   "ledger_key_nonce": {
                     "nonce": 801925984706572462
-                  }
-                },
-                "durability": "temporary",
-                "val": "void"
-              }
-            },
-            "ext": "v0"
-          },
-          6311999
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-            "key": {
-              "ledger_key_nonce": {
-                "nonce": 5541220902715666415
-              }
-            },
-            "durability": "temporary"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-                "key": {
-                  "ledger_key_nonce": {
-                    "nonce": 5541220902715666415
                   }
                 },
                 "durability": "temporary",
@@ -491,7 +491,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "burn"
+                "symbol": "clawback"
               }
             ],
             "data": {
@@ -502,7 +502,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 4000000
+                    "lo": 3000000
                   }
                 }
               ]
@@ -521,7 +521,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "BURN"
+                "symbol": "CLAWBACK"
               }
             ],
             "data": {
@@ -532,7 +532,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 4000000
+                    "lo": 3000000
                   }
                 }
               ]
@@ -554,7 +554,7 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "burn"
+                "symbol": "clawback"
               }
             ],
             "data": "void"
@@ -607,7 +607,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 6000000
+                "lo": 7000000
               }
             }
           }
@@ -657,7 +657,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 6000000
+                "lo": 7000000
               }
             }
           }
