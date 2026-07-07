@@ -98,15 +98,35 @@ echo ""
 # `get_role Admin` view that none of them exposed — it was dead code
 # that always fell through to a warning.
 echo "    emt_token get_admin (sanity check):"
+# Capture stderr separately so we can distinguish the common
+# “method wasn't exposed on the deployed bytecode” failure from a
+# genuine RPC / auth error. Get_admin landed in commit 40e087f;
+# pre-40e087f deployments never registered the symbol, so the host
+# rejects the invoke with a FuncNotFound-shaped HostError — the
+# canonical Soroban shape is `HostError: Error(Contract, #10)`.
+# We match two branches:
+#   - textual tokens nearby (`method|func|hostfn|function`
+#     followed by `not.?found|missing|unknown|implemented`)
+#   - the host error numeric code (#10 / #N) so legacy envelopes
+#     from older SDKs that emit `Error(Contract, #10)` alone still
+#     land in the right branch.
+err="$(mktemp)" || { echo "ERROR: mktemp failed" >&2; exit 1; }
+# shellcheck disable=SC2064 # we want $err expanded now so the trap
+#                            # stays correct under set -u.
+trap "rm -f '$err'" EXIT
 if admin_addr="$(stellar contract invoke \
-       --id "$EMT_CONTRACT_ID" --source "$ADMIN_SECRET" \
-       --network "$NETWORK" --rpc-url "$RPC_URL" \
-       --network-passphrase "$NETWORK_PASSPHRASE" \
-       -- get_admin 2>/dev/null)"; then
+       --id \"$EMT_CONTRACT_ID\" --source \"$ADMIN_SECRET\" \
+       --network \"$NETWORK\" --rpc-url \"$RPC_URL\" \
+       --network-passphrase \"$NETWORK_PASSPHRASE\" \
+       -- get_admin 2>"$err")"; then
   echo "      admin = $admin_addr"
+elif grep -qiE '(method|func|hostfn|function).*(not\.?found|missing|unknown|implemented)|func\.?not\.?found|HostError.*Contract.*#?10\b' "$err"; then
+  echo "      <contract predates commit 40e087f — emt_token was deployed without the get_admin view. Re-deploy from HEAD, or read the admin from the PROPOSE/ACCEPT event log >"
 else
   echo "      <get_admin failed — investigate RPC / contract state>"
 fi
+trap - EXIT
+rm -f "$err"
 echo ""
 echo "    Contract IDs (for off-chain tooling / dashboards):"
 echo "      emt_token        = $EMT_CONTRACT_ID"
