@@ -572,6 +572,21 @@ impl EmtToken {
         env.events().publish((CANCEL_AD,), (current_admin,));
     }
 
+    /// Read the current admin address.
+    ///
+    /// Authoritative view for off-chain tooling (`scripts/rotate-admin.sh`
+    /// pre-flight, compliance dashboards, ops playbooks). Mirrors the
+    /// `compliance_hook.transfer_admin` contract which has the same
+    /// admin-during-handover inconsistency window that any "read admin"
+    /// view inherits — callers needing the *signed* canonical admin
+    /// should pair this with the `PROPOSE` / `ACCEPT` event index.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("contract not initialized")
+    }
+
     /// Read the current pending admin proposal, if any.
     pub fn pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
@@ -1379,6 +1394,28 @@ mod tests {
     fn test_pending_admin_none_after_init() {
         let (_env, _a, _m, _p, _b, client) = setup();
         assert_eq!(client.pending_admin(), None);
+    }
+
+    #[test]
+    fn test_get_admin_returns_initial_address() {
+        // After `initialize`, `get_admin` must return the address that
+        // was passed in (and *not* a "fresh" or random address). The
+        // off-chain `scripts/rotate-admin.sh` pre-flight relies on
+        // this read to sanity-check the proposed successor.
+        let (_env, admin, _m, _p, _b, client) = setup();
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_get_admin_reflects_handover() {
+        // After the two-step handover completes, `get_admin` must
+        // return the new admin — not the original. Verifies the view
+        // tracks the on-chain role, not a snapshot or cached value.
+        let (_env, _a, _m, _p, _b, client) = setup();
+        let new_admin = Address::generate(&_env);
+        client.propose_admin(&new_admin);
+        client.accept_admin();
+        assert_eq!(client.get_admin(), new_admin);
     }
 
     /// End-to-end test of the two-step admin handover. Walks through
