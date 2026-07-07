@@ -62,35 +62,48 @@ src/
 ├── handlers/
 │   └── txApprove.ts            # POST /tx-approve (the main decision flow)
 ├── compliance/
-│   ├── kyc.ts                  # KycProvider interface + MockKycProvider
-│   ├── sanctions.ts            # SanctionsProvider + MockSanctionsProvider
-│   ├── limits.ts               # LimitsProvider + MockLimitsProvider
+│   ├── kyc.ts                  # KycProvider interface + Mock + HttpKycProvider
+│   ├── sanctions.ts            # SanctionsProvider + Mock + HttpSanctionsProvider
+│   ├── limits.ts               # LimitsProvider + MockLimitsProvider + EmtTokenLimitsProvider
 │   └── travelRule.ts           # TravelRuleProvider + MockTravelRuleProvider
+├── common/
+│   └── http.ts                 # vendor-neutral HTTP POST/JSON helper (used by Http* providers)
 └── stellar/
     ├── signer.ts               # Wraps Keypair, signs approved transactions
     └── decoder.ts              # decodeTxXdr → DecodedTx
 
 test/
-├── txApprove.test.ts           # integration tests via supertest
-└── limits.test.ts              # unit tests for MockLimitsProvider + EmtTokenLimitsProvider
+├── txApprove.test.ts           # integration tests via supertest (mock providers)
+├── limits.test.ts              # unit tests for MockLimitsProvider + EmtTokenLimitsProvider
+└── httpProviders.test.ts       # integration tests via http.createServer mock for HttpKycProvider/HttpSanctionsProvider + standalone unit tests
 ```
 
 ## What's intentionally NOT in the skeleton
 
-The skeleton is enough to run integration tests against the mock
-providers. A production deployment needs:
+The skeleton ships the HTTP wiring for KYC + sanctions (vendor-neutral
+JSON, Bearer auth, 5 s timeout) and the on-chain velocity-limit read.
+A real production deployment additionally needs:
 
-- **Real KYC / sanctions / travel-rule provider clients.** The
-  interface contracts are defined in `src/compliance/*.ts`; the HTTP
-  clients are the next step.
-- **On-chain velocity-limit read.** Done. `EmtTokenLimitsProvider`
-  reads `emt_token.get_velocity_limit(addr)` and
-  `emt_token.get_outflow_today(addr)` directly via the Soroban RPC
-  client. Wired in automatically when `MOCK_MODE=0`.
-- **Decision persistence.** The `/status/:txHash` endpoint currently
-  404s. A real impl persists `{tx_hash, decision, decided_at,
+- **Vendor-specific KYC / sanctions adapters.** The shipped
+  `HttpKycProvider` / `HttpSanctionsProvider` speak a vendor-neutral
+  JSON contract (see docs/sep0008-hook.md §6.1 / §6.2). To integrate a
+  specific vendor (Jumio, Onfido, Sumsub, Chainalysis, …), write a
+  thin adapter that translates the vendor's request/response into the
+  neutral shape before it's handled by `HttpKycProvider`-equivalent
+  logic. Keep vendor SDKs out of the hook server.
+- **Travel-rule HTTP client.** The KYC + sanctions HTTP path is in;
+  the travel-rule provider still ships only the in-process mock.
+- **Decision persistence.** `/status/:txHash` currently 404s. Real
+  impl persists `{tx_hash, decision, decided_at,
   expires_at_ledger}` in Redis or a small SQL table so the compliance
   team can audit past decisions.
+- **Optional on-chain recording.** The skeleton doesn't call
+  `compliance_hook.approve_transaction(tx_hash)` after signing.
+  Wiring this in is a one-liner once the SDK is integrated; see the
+  spec §7 for the policy trade-offs.
+- **Rate limiting.** The `RATE_LIMIT_PER_MIN` env var is read but
+  not enforced. Plug in `express-rate-limit` or your LB's rate
+  limiter.
 - **Optional on-chain recording.** The skeleton doesn't call
   `compliance_hook.approve_transaction(tx_hash)` after signing.
   Wiring this in is a one-liner once the SDK is integrated; see the

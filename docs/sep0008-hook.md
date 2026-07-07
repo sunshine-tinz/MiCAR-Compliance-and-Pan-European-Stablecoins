@@ -336,6 +336,76 @@ operations (native `payment` or Soroban `invokeHostFunction` with an
 be recovered (e.g. account-merging ops), the check is skipped — the
 contract side rejects non-transfer ops against `emt_token` regardless.
 
+The KYC and Sanctions providers follow the same dual-implementation
+pattern (mock + real HTTP) — see §6.1 and §6.2 for the vendor-neutral
+JSON protocol their HTTP implementations speak.
+
+#### 6.1. KYC HTTP protocol
+
+`HttpKycProvider` POSTs `{baseUrl}/kyc/screen` with body
+
+```json
+{ "address": "GABC..." }
+```
+
+and `Authorization: Bearer <KYC_PROVIDER_API_KEY>`. The expected
+vendor-neutral response shape:
+
+```json
+// verified
+{ "status": "verified",   "level": "basic" | "enhanced" }
+
+// pending (action_url required)
+{ "status": "pending",    "action_url": "https://..." }
+
+// failed (reason optional — defaults to "rejected by provider")
+{ "status": "failed",     "reason": "..." }
+
+// unknown — treat as fail-closed at the provider-vendor boundary
+{ "status": "unknown" }
+```
+
+Anything else (4xx/5xx, malformed JSON, missing `action_url` on a
+`pending` response, unknown `status`) is treated as a hard provider
+failure: the provider throws `HttpProviderError` whose `.code` is
+one of `network`, `timeout`, `http_status`, or `malformed`. Under
+MiCAR Art. 23, fail-closed is the right default; silent coercion of
+incomplete verdicts to `unknown` would be a compliance fault.
+
+The integration test `scripts/sep0008-server/test/httpProviders.test.ts`
+mocks the upstream via `http.createServer` on a random port and
+verifies every documented decision path end-to-end through the
+handler.
+
+#### 6.2. Sanctions HTTP protocol
+
+`HttpSanctionsProvider` POSTs `{baseUrl}/sanctions/screen` with body
+
+```json
+{ "address": "GABC..." }
+```
+
+and `Authorization: Bearer <SANCTIONS_PROVIDER_API_KEY>`. The expected
+vendor-neutral response shape:
+
+```json
+// no hit
+{ "hit": false }
+
+// hit — list / matched_field / matched_value are all required
+{
+  "hit": true,
+  "list": "EU_CFSP" | "OFAC_SDN" | "UN_CONS" | "UK_HMT" | <vendor-specific>,
+  "matched_field": "address" | "name",
+  "matched_value": "<matched value>"
+}
+```
+
+Same transport error model as §6.1. A `hit:true` response that omits
+the field details throws `HttpProviderError{ code: "malformed" }` and
+the handler surfaces it as Express 500 (handler-level try/catch
+around sanctions is on the roadmap; pinned by the integration test).
+
 ```ts
 // src/compliance/travelRule.ts
 export interface TravelRuleProvider {

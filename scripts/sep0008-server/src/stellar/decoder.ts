@@ -116,9 +116,13 @@ function readOpBody(op: unknown): OpBody {
     typeof op === "object" &&
     typeof (op as { body?: unknown }).body === "function"
   ) {
-    return (op as { body: () => unknown })
-      .body()
-      .call(op) as unknown as OpBody;
+    // SDK 12's high-level Operation wrapper exposes the inner xdr body
+    // via `.body()`. The function-typed cast below is needed because
+    // TS 5.x disallows `.call(...)` on a value of type `unknown`
+    // (TS2571); we explicitly type `.body()` as `Function` to make the
+    // `.call` site checkable.
+    const bodyFn = (op as { body: () => unknown }).body() as Function;
+    return bodyFn.call(op) as unknown as OpBody;
   }
   return op as OpBody;
 }

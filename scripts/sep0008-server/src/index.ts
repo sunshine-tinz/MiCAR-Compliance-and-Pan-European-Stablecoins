@@ -3,7 +3,8 @@
  *
  * Wires together:
  *   - config (env vars, validated at startup)
- *   - compliance providers (mock or real, depending on MOCK_MODE)
+ *   - compliance providers (HTTP-based real ones when MOCK_MODE=0,
+ *     in-process mocks otherwise)
  *   - Stellar signer
  *   - Express app with health, ready, status, and tx-approve endpoints
  *   - API-key auth middleware for /tx-approve
@@ -14,8 +15,16 @@
 import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
 import { loadConfig, type Config } from "./config";
-import { MockKycProvider, type KycProvider } from "./compliance/kyc";
-import { MockSanctionsProvider, type SanctionsProvider } from "./compliance/sanctions";
+import {
+  HttpKycProvider,
+  MockKycProvider,
+  type KycProvider,
+} from "./compliance/kyc";
+import {
+  HttpSanctionsProvider,
+  MockSanctionsProvider,
+  type SanctionsProvider,
+} from "./compliance/sanctions";
 import {
   EmtTokenLimitsProvider,
   MockLimitsProvider,
@@ -27,8 +36,49 @@ import { makeTxApproveHandler } from "./handlers/txApprove";
 
 const config = loadConfig();
 
-const kyc: KycProvider = new MockKycProvider();
-const sanctions: SanctionsProvider = new MockSanctionsProvider();
+// ── Provider wiring ────────────────────────────────────────────────────────────
+//
+// Each provider follows a fail-loud two-state pattern:
+//
+//  1. `MOCK_MODE=1`         → use the in-process Mock* (default).
+//  2. `MOCK_MODE=0` + URL   → use the real HTTP provider (production).
+//
+// `MOCK_MODE=0` with a missing provider URL throws at startup. A
+// silent fallback to MockKycProvider in production would let a
+// misconfigured deploy route every wallet through the in-process
+// "anything not GVERIFIED* is pending" branch — operators would
+// notice nothing until a real customer hit the KYC queue. Failing
+// at process startup keeps the failure mode loudly visible.
+
+if (!config.mockMode && !config.providers.kyc) {
+  throw new Error(
+    "[startup] MOCK_MODE=0 but KYC_PROVIDER_URL is unset — refusing " +
+      "to start. Set MOCK_MODE=1 for offline dev, or wire " +
+      "KYC_PROVIDER_URL + KYC_PROVIDER_API_KEY for production."
+  );
+}
+if (!config.mockMode && !config.providers.sanctions) {
+  throw new Error(
+    "[startup] MOCK_MODE=0 but SANCTIONS_PROVIDER_URL is unset — " +
+      "refusing to start. Set MOCK_MODE=1 for offline dev, or wire " +
+      "SANCTIONS_PROVIDER_URL + SANCTIONS_PROVIDER_API_KEY for production."
+  );
+}
+
+const kyc: KycProvider = config.mockMode
+  ? new MockKycProvider()
+  : new HttpKycProvider({
+      url: config.providers.kyc!.url,
+      apiKey: config.providers.kyc!.apiKey,
+    });
+
+const sanctions: SanctionsProvider = config.mockMode
+  ? new MockSanctionsProvider()
+  : new HttpSanctionsProvider({
+      url: config.providers.sanctions!.url,
+      apiKey: config.providers.sanctions!.apiKey,
+    });
+
 // LimitsProvider: mock (default, dev/test) or real (production).
 // The real provider reads `emt_token.get_velocity_limit(addr)` and
 // `emt_token.get_outflow_today(addr)` via Soroban RPC. See
@@ -74,7 +124,13 @@ app.get("/health", (_req: Request, res: Response) => {
 
 app.get("/ready", (_req: Request, res: Response) => {
   // The skeleton is always "ready" — a real impl would check
-  // provider connectivity here.
+  // provider connectivity here. With the HTTP providers wired, this
+  // could PING each configured vendor on demand; kept as a TODO
+  // because vendor-specific ping endpoints aren't predictable.
+  //
+  // If we reach this handler, startup passed the fail-loud checks
+  // above, so every provider is either wired (MOCK_MODE=0) or in
+  // process (MOCK_MODE=1). There's no third state to surface.
   res.status(200).json({
     status: "ready",
     providers: {
