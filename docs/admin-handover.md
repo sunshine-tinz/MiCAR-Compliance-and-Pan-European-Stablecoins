@@ -134,7 +134,7 @@ set (same guard as `deploy.sh`).
 | Symptom | Cause | Recovery |
 |---|---|---|
 | `propose_admin` panics with `"already admin"` | `new_admin == current admin` | Pick a different successor. |
-| `propose_admin` panics with auth error | `ADMIN_SECRET` is not the current admin | Verify the secret. The contract tells you who the admin is via... well, it doesn't yet; add a `get_admin` view first. |
+| `propose_admin` panics with auth error | `ADMIN_SECRET` is not the current admin | Verify the secret. The contract exposes `get_admin` (and `pending_admin`) so `scripts/rotate-admin.sh`'s pre-flight can read the current admin and refuse to no-op. |
 | `accept_admin` panics with `"no pending admin"` | No proposal in flight (or the previous one was cancelled) | Run step 1 again. |
 | `accept_admin` panics with auth error | The signing keypair is not the **proposed** successor | Sign with `NEW_ADMIN_SECRET`. The contract calls `pending_admin.require_auth()` — only the proposed address works. |
 | `pending_admin` returns a different address than expected | A previous `propose_admin` was overwritten, or a stale proposal is in flight | Re-run `propose_admin` with the intended address (this overwrites). |
@@ -206,7 +206,7 @@ to clear the pending proposal. Then re-propose a clean successor.
 ## Reference
 
 - `contracts/emt_token/src/lib.rs` — `propose_admin`, `accept_admin`,
-  `cancel_proposed_admin`, `pending_admin` entries.
+  `cancel_proposed_admin`, `pending_admin`, `get_admin` entries.
 - `sdk/src/EmtClient.ts` — `proposeAdmin`, `acceptAdmin`,
   `cancelProposedAdmin`, `getPendingAdmin` methods.
 - `scripts/rotate-admin.sh` — automation script.

@@ -74,29 +74,40 @@ Read [`docs/architecture.md`](docs/architecture.md) for the full design.
 ## Repository layout
 
 ```
-contracts/          Soroban smart contracts (Rust)
-├── emt_token/         Core EMT token (mint/burn/transfer/allowances)
-├── compliance_hook/   SEP-0008 approval ledger with TTL
-└── oracle_interface/  Reserve attestation oracle with quorum & freshness
+contracts/                Soroban smart contracts (Rust)
+├── emt_token/              Core EMT token (mint/burn/transfer/allowances,
+|                           velocity, aggregate cap, admin handover,
+|                           extend_storage_ttl)
+├── compliance_hook/        SEP-0008 approval ledger with TTL
+└── oracle_interface/       Reserve attestation oracle with quorum & freshness
 
-sdk/                TypeScript SDK (@eur-emt/sdk)
+sdk/                      TypeScript SDK (@eur-emt/sdk)
 ├── src/
-│   ├── EmtClient.ts   Read & write methods, error wrapping
-│   └── index.ts       Public barrel
-└── README.md          SDK reference
+│   ├── EmtClient.ts        Read & write methods, error wrapping
+│   └── index.ts            Public barrel
+├── __tests__/              Jest unit tests with mocked Soroban RPC
+└── README.md               SDK reference
 
-scripts/            Deployment scripts
-├── deploy.sh           Build wasm + deploy + write .deployment.json
-└── initialize.sh       Read .deployment.json + assign roles
+scripts/                  Deployment & automation
+├── deploy.sh                Build wasm + deploy + write .deployment.json
+├── initialize.sh            Read .deployment.json + assign roles
+├── rotate-admin.sh          One-shot two-step admin handover
+├── verify.sh                Local CI mirror (fmt + clippy + test + sdk test)
+└── sep0008-server/          Off-chain SEP-0008 hook server (Express + TS)
+    ├── src/                 Express app, providers, signer, XDR decoder
+    ├── test/                Jest suite (mock-mode integration + unit)
+    └── Dockerfile           Containerised deployment
 
-docs/               Design & compliance documentation
-├── architecture.md     System design
-├── micar-compliance.md MiCAR obligations mapping
-└── sep0008-hook.md     Off-chain hook server spec
+docs/                     Design & compliance documentation
+├── architecture.md          System design
+├── micar-compliance.md      MiCAR obligations mapping
+├── admin-handover.md        Two-step admin rotation runbook
+└── sep0008-hook.md          Off-chain hook server spec
 
-.github/workflows/  CI (fmt + clippy + test + sdk build + docs sanity)
-SECURITY.md         Vulnerability disclosure policy
-.env.example        Environment variable template
+.github/workflows/        CI (fmt + clippy + test + sdk build + docs sanity)
+SECURITY.md               Vulnerability disclosure policy & pre-launch checklist
+.env.example              Environment variable template
+lefthook.yml              Local pre-commit / pre-push gate (mirrors CI)
 ```
 
 ---

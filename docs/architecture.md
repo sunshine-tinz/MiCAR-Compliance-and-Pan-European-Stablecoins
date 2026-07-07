@@ -133,12 +133,20 @@ This project draws from:
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full list of open issues.
 High-impact areas:
 
-1. **SEP-0008 hook server** — Node.js/TypeScript server that intercepts
-   transactions, checks KYC, and co-signs approved ones.
-2. **Transfer velocity limits** — Per-address daily/weekly transfer caps
-   (MiCAR Art. 46).
-3. **Multi-sig admin** — Replace single admin key with a Soroban multisig
-   account for institutional-grade key management.
-4. **Reserve oracle quorum** — Require M-of-N attestors to agree before
-   recording a reserve attestation.
-5. **SDK completion** — `transfer`, `mint`, `burn`, `pause`, event listeners.
+1. **Oracle-enforced mint gate** — `mint()` should refuse when
+   `oracle.is_qualified()` is false or stale. The interfaces are in
+   place; the cross-contract call needs a single Soroban deployment
+   that exposes the oracle's contract id to the token contract.
+2. **Multi-sig admin** — Replace the single admin key with a Soroban
+   native multisig (≥ 2-of-3, ideally 3-of-5) for institutional-grade
+   key management. Two-step handover (`propose_admin` / `accept_admin`)
+   is in place; the multisig sits above it.
+3. **Lazy-prune tracked addresses** — Drop addresses from
+   `TrackedAddresses` / `TrackedAllowances` once their balance has been
+   zero for an extended period and they have no other persistent
+   state, to keep the books bounded as the contract's lifetime grows.
+4. **Real KYC / sanctions / travel-rule provider clients** — the
+   interfaces ship in `scripts/sep0008-server/src/compliance/`; HTTP
+   clients (Jumio / Chainalysis / Notabene) are the next step.
+5. **Property-based / fuzz tests** — for mint/burn/transfer arithmetic,
+   overflow edges, and the velocity sliding-window transitions.

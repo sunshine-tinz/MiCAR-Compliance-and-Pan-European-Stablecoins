@@ -30,17 +30,24 @@ contracts/
 └── oracle_interface/   # Reserve attestation oracle (Rust/Soroban)
 
 sdk/
-└── src/
-    └── EmtClient.ts    # TypeScript SDK client
+├── src/
+│   └── EmtClient.ts    # TypeScript SDK client
+└── __tests__/          # Jest unit tests
 
 scripts/
-├── deploy.sh           # Deploy contracts to testnet
-├── initialize.sh       # Initialize contract roles
-└── sep0008-server/     # Off-chain compliance hook server (TODO)
+├── deploy.sh           # Build wasm + deploy contracts to testnet/mainnet
+├── initialize.sh       # Initialize contract roles after deploy
+├── rotate-admin.sh     # One-shot automation for the two-step admin handover
+├── verify.sh           # Local CI mirror (fmt + clippy + test + sdk test)
+└── sep0008-server/     # Off-chain SEP-0008 compliance hook server
+    ├── src/            # Express app, providers, signer, XDR decoder
+    ├── test/           # Jest suite (mock-mode integration + unit)
+    └── Dockerfile      # Containerised deployment
 
 docs/
 ├── architecture.md     # System design
 ├── micar-compliance.md # MiCAR obligations mapping
+├── admin-handover.md   # Two-step admin rotation runbook
 └── sep0008-hook.md     # Hook server specification
 ```
 
@@ -66,57 +73,76 @@ cargo build --release --target wasm32-unknown-unknown
 ## Open Issues
 
 Below are the key areas where contributions are needed, roughly ordered by
-impact. Each maps to a GitHub issue.
+impact. Shipped checkmarks link the section so contributors don't have
+to grep for the contract primitive.
+
+## Shipped
+
+### Contracts (Rust/Soroban)
+
+| Issue | Description | Where |
+|---|---|---|
+| `approve` / `transfer_from` | ERC-20-style allowance mechanism + delegated transfer | `contracts/emt_token/src/lib.rs` |
+| Transfer velocity limits | Per-address 24h two-bucket sliding window (MiCAR Art. 46) | `set_global_velocity_limit` / `set_velocity_limit` / `get_outflow_today` |
+| Aggregate mint cap | Hard ceiling on `total_supply` enforced in `mint()` | `set_aggregate_mint_cap` / `unset_aggregate_mint_cap` |
+| Two-step admin transfer | `propose_admin` + `accept_admin` + `cancel_proposed_admin` | [`docs/admin-handover.md`](docs/admin-handover.md) |
+| 5-year record retention | `extend_storage_ttl` batch-extends every Balance / Allowance / Blocklisted / Velocity entry to the host ceiling | MiCAR Art. 23 / 48 |
+| `get_admin` / `pending_admin` views | Off-chain tooling reads state | `get_admin` / `pending_admin` |
+
+### SDK (TypeScript)
+
+| Issue | Description | Where |
+|---|---|---|
+| `transfer` / `mint` / `burn` / `approve` / `transferFrom` | Build-simulate-sign-submit-poll helpers | `sdk/src/EmtClient.ts` |
+| `pause` / `unpause` / `blocklist` / `unblocklist` / `clawback` / `setReserveAttestation` | Admin & compliance operations | `sdk/src/EmtClient.ts` |
+| `setGlobalVelocityLimit` / `setVelocityLimit` / `clearVelocityLimit` / `getVelocityLimit` / `getOutflowToday` / `setAggregateMintCap` / `extendStorageTtl` | MiCAR Art. 46 wraps + 5-year retention | MiCAR Art. 46 / 48 |
+| SDK tests | Unit tests with mocked Soroban RPC | `sdk/__tests__/EmtClient.test.ts` |
+
+### SEP-0008 Hook Server (Node.js/TypeScript)
+
+| Issue | Description | Where |
+|---|---|---|
+| Server skeleton | Express + `/health` + `/ready` + `/tx-approve` | `scripts/sep0008-server/src/index.ts` |
+| KYC / Sanctions / Travel-rule | Interface + in-process mock providers | `scripts/sep0008-server/src/compliance/` |
+| On-chain velocity-limit read | `EmtTokenLimitsProvider` reads `get_velocity_limit` + `get_outflow_today` via Soroban RPC, wired in when `MOCK_MODE=0` | `scripts/sep0008-server/src/compliance/limits.ts` |
+| OpenAPI surface | Full HTTP spec in [`docs/sep0008-hook.md`](docs/sep0008-hook.md) §2–§3 | spec document |
+| Docker | Containerised deployment | `scripts/sep0008-server/Dockerfile` |
+| Mock-mode Jest suite | Integration + unit tests via supertest | `scripts/sep0008-server/test/` |
+
+## Open
 
 ### Contracts (Rust/Soroban)
 
 | Issue | Description | Complexity |
 |---|---|---|
-| `transfer_from` | Delegated transfers with allowances | Medium |
-| `approve` | ERC-20-style allowance mechanism | Medium |
-| Transfer velocity limits | Per-address daily/weekly caps (MiCAR Art. 46) ✅ shipped | High |
-| Two-step admin transfer | Propose + accept pattern for admin role handover ✅ shipped | Medium |
-| Extend-storage TTL entry point | `extend_storage_ttl` admin entry to batch-refresh persistent entry TTLs to the host ceiling for MiCAR Art. 23 / 48 5-year retention ✅ shipped | High |
-| Lazy-prune tracking books | Drop addresses from `TrackedAddresses` / `TrackedAllowances` once their balance has been zero for an extended period and they have no other persistent state, to keep the books bounded over the contract's lifetime | Medium |
-| Mint supply cap | Aggregate supply limit enforced in `mint()` ✅ shipped | Trivial |
-| Oracle integration | `mint()` checks oracle before proceeding | High |
-| Clawback policy | Define whether clawback burns or credits admin | Trivial |
-| Attestation expiry | Reject stale attestations in oracle_interface | Medium |
-| Oracle quorum | Require M-of-N attestors to agree | High |
-| Fuzz tests | Property-based tests for mint/burn/transfer | High |
+| Oracle-enforced mint gate | `mint()` should refuse when `oracle.is_qualified()` is false or stale. The on-chain wiring (cross-contract call) needs a shared deployment where the oracle contract id is known to the token contract. | High |
+| Multi-sig admin | Replace single admin key with a Soroban native multisig (≥ 2-of-3, ideally 3-of-5). Two-step handover is in place; the multisig sits above it. | High |
+| Lazy-prune tracked addresses | Drop addresses from `TrackedAddresses` / `TrackedAllowances` once their balance is zero for an extended period and no other persistent state exists, to keep the books bounded over the contract's lifetime | Medium |
 
 ### SDK (TypeScript)
 
 | Issue | Description | Complexity |
 |---|---|---|
-| `transfer()` method | With SEP-0008 hook pre-flight | Medium |
-| `mint()` method | Admin/minter operation | Medium |
-| `burn()` method | Redemption operation | Medium |
-| `pause()` / `unpause()` | Admin operations | Trivial |
-| `blocklist()` / `unblocklist()` | Compliance operations | Trivial |
-| Event listeners | Subscribe to MINT, BURN, TRANSFER events | High |
-| Retry logic | Handle RPC failures gracefully | Medium |
-| SDK tests | Unit tests with mock Soroban RPC | High |
+| Event listeners | Subscribe to MINT, BURN, TRANSFER, BLOCKLIST, PROPOSE, ACCEPT, CANCEL events | High |
+| Retry logic | Handle RPC failures and `getTransaction` timeouts gracefully (current SDK bails on first error) | Medium |
+| Real KYC / sanctions / travel-rule SDKs | Not applicable — those live in the SEP-0008 hook server, not the SDK | — |
 
 ### SEP-0008 Hook Server (Node.js/TypeScript)
 
 | Issue | Description | Complexity |
 |---|---|---|
-| Server skeleton | Express server with `POST /tx-approve` ✅ shipped (`scripts/sep0008-server/`) | Medium |
-| KYC check stub | Interface for plugging in a KYC provider ✅ shipped (interface + mock) | Medium |
-| Sanctions screening | Stub + interface for sanctions API ✅ shipped (interface + mock) | Medium |
-| Transaction limits | Read limits from `emt_token` contract (mock shipped; on-chain read via SDK is the next step) | High |
-| Travel rule | Collect and forward data for > €1,000 transfers (interface + mock shipped; real provider integration pending) | High |
-| Docker config | Containerise the hook server ✅ shipped | Trivial |
-| Integration tests | Test against local Stellar testnet (mock-mode Jest suite ships; testnet integration is the next step) | High |
+| Real provider clients | HTTP clients for Jumio / Chainalysis / Notabene / Sygna behind the existing `KycProvider` / `SanctionsProvider` / `TravelRuleProvider` interfaces | High |
+| Decision persistence | Persist `{tx_hash, decision, decided_at, expires_at_ledger}` in Redis or SQL so `/status/:txHash` is answerable and the compliance team can audit history | Medium |
+| On-chain recording | Optionally call `compliance_hook.approve_transaction(tx_hash)` after signing for an auditable on-chain trail | Medium |
+| Rate limiting | The `RATE_LIMIT_PER_MIN` env var is read but not enforced; plug in `express-rate-limit` or push to the LB | Trivial |
+| Testnet integration tests | Run the Jest suite against a local or testnet Stellar node (today's suite is mock-mode only) | Medium |
 
 ### Documentation
 
 | Issue | Description | Complexity |
 |---|---|---|
-| OpenAPI spec | Document the hook server API ✅ shipped (full HTTP spec in [`docs/sep0008-hook.md`](docs/sep0008-hook.md) §2–§3, with error code catalog) | Medium |
-| Deployment guide | Step-by-step mainnet deployment | Medium |
-| Audit checklist | Pre-launch security checklist | Medium |
+| Deployment guide | Step-by-step mainnet deployment (key ceremony, oracle-onboarding, multisig wiring) | Medium |
+| Audit checklist expansion | Tighten the pre-launch checklist in `SECURITY.md` with concrete tooling references (e.g., `cargo audit`, `stellar-cli` ledger dumpers) | Medium |
 
 ## Code Style
 

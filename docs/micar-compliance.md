@@ -24,7 +24,7 @@ This project implements an **EMT** pegged to the Euro.
 **Implementation:**
 - `burn()` in `emt_token` is the on-chain leg of redemption
 - Off-chain: the issuer must release fiat within the statutory period
-- TODO: implement a `request_redemption` event that triggers the off-chain flow
+- **Open:** a `request_redemption` event that triggers the off-chain flow is not yet emitted by the contract (the off-chain redemption queue exists as a separate workflow)
 
 ### Art. 45 — Reserve Asset Requirements
 
@@ -32,27 +32,38 @@ This project implements an **EMT** pegged to the Euro.
 > the issuer's own assets.
 
 **Implementation:**
-- `oracle_interface` contract stores reserve attestations on-chain
+- `oracle_interface` contract stores reserve attestations on-chain with quorum + staleness checks (`set_quorum`, `set_max_attestation_age`, `is_qualified`)
 - `set_reserve_attestation()` in `emt_token` anchors the attestation document hash
-- TODO: enforce that `mint()` can only proceed if reserve ≥ supply + mint_amount
+- `submit_attestation` is attestor-gated and refuses under-collateralised reports (`reserve_balance must cover token_supply`)
+- **Open:** `mint()` does not yet read the oracle and gate issuance on `is_qualified()` — issuers currently enforce this off-chain. The wiring is a one-liner extension (see [`CONTRIBUTING.md`](../CONTRIBUTING.md))
 
 ### Art. 23 — AML/CFT Controls
 
 > Issuers must implement AML/CFT procedures equivalent to those for e-money.
 
 **Implementation:**
-- `blocklist` / `unblocklist` in `emt_token` for sanctions enforcement
-- `compliance_hook` contract records SEP-0008 approvals
-- Off-chain: SEP-0008 hook server screens every transaction against KYC/AML
-- TODO: integrate a sanctions screening API (e.g., Chainalysis, Elliptic)
+- `blocklist` / `unblocklist` in `emt_token` for sanctions enforcement (TTL-backed to the host ceiling so a blocklist cannot silently expire — MiCAR Art. 23 compliance fault)
+- `compliance_hook` contract records SEP-0008 approvals with an `APPROVAL_TTL_LEDGERS` ledger window
+- Off-chain: the SEP-0008 hook server (`scripts/sep0008-server/`) screens every transaction against KYC, sanctions, velocity limits, and travel-rule data
+- **Open:** Real KYC / sanctions / travel-rule provider clients are stubbed behind the `KycProvider` / `SanctionsProvider` / `TravelRuleProvider` interfaces; the in-process mocks are wired by default (`MOCK_MODE=1`). A production deployment plugs HTTP clients into those interfaces
+
+### Art. 23 / Art. 48 — 5-Year Record Retention
+
+> EMI issuers must retain records for at least 5 years after the relationship ends.
+
+**Implementation:**
+- `emt_token::extend_storage_ttl` is an admin entry that batch-extends every Balance / Allowance / Blocklisted / VelocityLimit / VelocityState entry, plus the `TrackedAddresses` / `TrackedAllowances` index books, to the Soroban host ceiling
+- Per-write TTL bumps run on every state-mutating call (host ceiling ≈ 1 year per entry; the admin cron closes the remaining 4 years)
+- The contract-internal tracking books ensure the address space is enumerable (Soroban persistent storage does not support key iteration natively)
 
 ### Art. 46 — Transaction Limits
 
 > The ECB may impose limits on EMT transactions to protect monetary policy.
 
 **Implementation:**
-- TODO: per-address daily transfer limits in `emt_token`
-- TODO: aggregate supply cap enforced in `mint()`
+- Per-address 24h outgoing-volume cap: two-bucket sliding window in `emt_token` (`set_global_velocity_limit`, `set_velocity_limit`, `clear_velocity_limit`, `get_velocity_limit`, `get_outflow_today`). Charged against the `from` address on both `transfer` and `transfer_from`
+- Aggregate supply cap: `emt_token::set_aggregate_mint_cap` enforces a hard ceiling on `total_supply`; `unset_aggregate_mint_cap` removes it; both refuse to set a cap below the existing supply (would silently brick future mints)
+- The off-chain SEP-0008 hook server also projects a transfer against the on-chain cap (`EmtTokenLimitsProvider`, MiCAR Art. 22 compliance fault off → no signature)
 
 ### Art. 22 — Travel Rule (FATF)
 
@@ -60,8 +71,9 @@ This project implements an **EMT** pegged to the Euro.
 > accompany the transaction.
 
 **Implementation:**
-- TODO: SEP-0008 hook server collects and forwards travel rule data
-- TODO: integrate with a travel rule solution (e.g., Notabene, Sygna)
+- The SEP-0008 hook server (`scripts/sep0008-server/`) collects originator + beneficiary fields and validates them against the threshold inside `TravelRuleProvider.missingData`
+- `TxApproveRequest` carries `originator` / `beneficiary` per the spec
+- **Open:** Real provider integration (Notabene, Sygna, etc.) is stubbed behind the `TravelRuleProvider` interface, same pattern as KYC / sanctions
 
 ### Art. 35 — Authorisation
 
