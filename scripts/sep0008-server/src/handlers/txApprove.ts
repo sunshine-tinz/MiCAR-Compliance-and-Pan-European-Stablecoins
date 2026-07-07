@@ -4,6 +4,21 @@
  * Wires the four compliance providers and the Stellar signer into a
  * clean decision flow. Returns one of the five response shapes
  * documented in docs/sep0008-hook.md §2.1.
+ *
+ * Pipeline order (deliberate, see docs/sep0008-hook.md §1):
+ *   1. body validation       → 400 INVALID_TX
+ *   2. XDR decode            → 400 INVALID_TX
+ *   3. sanctions             → 400 SANCTIONS_HIT
+ *   4. KYC                   → 200 pending / 400 KYC_FAILED
+ *   5. velocity (MiCAR 46)   → 400 VELOCITY_EXCEEDED  ← NEW
+ *   6. travel-rule (MiCAR 22)→ 400 TRAVEL_RULE_MISSING
+ *   7. sign and return       → 200 approved
+ *
+ * Velocity runs before travel-rule because the travel-rule threshold
+ * check needs the same transfer amount we'd already extract for the
+ * velocity projection, and because the off-chain per-address limit is
+ * a cleaner deny / approve than constructing originator data the
+ * issuer wouldn't accept anyway.
  */
 
 import { Request, Response } from "express";
@@ -12,7 +27,7 @@ import type { SanctionsProvider } from "../compliance/sanctions";
 import type { LimitsProvider } from "../compliance/limits";
 import type { TravelRuleProvider } from "../compliance/travelRule";
 import type { StellarSigner } from "../stellar/signer";
-import { decodeTxXdr } from "../stellar/decoder";
+import { decodeTxXdr, extractTransferAmount } from "../stellar/decoder";
 import type { TxApproveRequest, TxApproveResponse } from "../types";
 
 export interface TxApproveDeps {
@@ -95,14 +110,53 @@ export function makeTxApproveHandler(deps: TxApproveDeps) {
       return;
     }
 
+    // ── Velocity check (MiCAR Art. 46) ────────────────────────────────────
+    // `extractTransferAmount` returns `null` when the operation isn't
+    // recognizable (e.g. CreateAccount, ManageData). Treat that as
+    // "no outgoing volume to assert" and skip the check — the
+    // downstream contracts will reject any non-transfer op against
+    // the EMT contract anyway. `additionalAmount = 0n` also makes the
+    // check a no-op for ops whose amount can't be recovered, which
+    // matches the pre-wiring behaviour.
+    const additionalAmount = extractTransferAmount(tx) ?? 0n;
+    let velocityExceeded: boolean;
+    try {
+      velocityExceeded = await deps.limits.wouldExceed(
+        sourceAddress,
+        additionalAmount
+      );
+    } catch (err) {
+      // Chain-driven providers can throw on RPC outages / simulation
+      // errors. Surface these as the documented `INTERNAL_ERROR` shape
+      // (spec §2.1 / §3) instead of leaking a generic Express 500 with
+      // no JSON body.
+      const r: TxApproveResponse = {
+        status: "error",
+        error_code: "INTERNAL_ERROR",
+        error: `velocity provider failed: ${(err as Error).message}`,
+      };
+      res.status(500).json(r);
+      return;
+    }
+    if (velocityExceeded) {
+      const r: TxApproveResponse = {
+        status: "rejected",
+        error_code: "VELOCITY_EXCEEDED",
+        error: "Transfer would exceed the per-address 24h velocity limit",
+        details: {
+          address: sourceAddress,
+          additional_amount: additionalAmount.toString(),
+        },
+      };
+      res.status(400).json(r);
+      return;
+    }
+
     // ── Travel-rule check ─────────────────────────────────────────────────
-    // We don't decode the inner Soroban invoke args here (would require
-    // a contract-spec). The reference impl just looks at the user-
-    // supplied travel-rule fields in the request body. A production
-    // impl would also extract the transfer amount from the operation
-    // and compare against the threshold.
+    // The travel-rule threshold check needs the same transfer amount we
+    // just extracted for the velocity projection; pass it through.
     const travelRuleMissing = await deps.travelRule.missingData(
-      0n, // placeholder; real impl extracts from op args
+      additionalAmount,
       body.originator,
       body.beneficiary
     );

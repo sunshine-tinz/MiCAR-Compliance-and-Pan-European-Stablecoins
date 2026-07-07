@@ -92,8 +92,20 @@ export function loadConfig(): Config {
       hookServerKeypair: Keypair.fromSecret(requireEnv("HOOK_SERVER_SECRET_KEY")),
     },
     contracts: {
-      emtTokenId: requireEnv("EMT_CONTRACT_ID"),
-      complianceHookId: requireEnv("COMPLIANCE_HOOK_CONTRACT_ID"),
+      // Mock-mode gate: the contract-id vars are only required when a
+      // provider actually needs them. In MOCK_MODE=1 the in-process
+      // MockLimitsProvider / MockKycProvider / etc. never read the
+      // chain, so failing on missing env would break the "boots
+      // without external credentials" promise from the README. In
+      // MOCK_MODE=0, missing contract IDs must crash at startup so a
+      // misconfigured deployment never silently uses empty-string
+      // addresses.
+      emtTokenId: mockMode
+        ? optionalEnv("EMT_CONTRACT_ID") ?? ""
+        : requireEnv("EMT_CONTRACT_ID"),
+      complianceHookId: mockMode
+        ? optionalEnv("COMPLIANCE_HOOK_CONTRACT_ID") ?? ""
+        : requireEnv("COMPLIANCE_HOOK_CONTRACT_ID"),
     },
     providers: {
       kyc: providerConfig("KYC"),

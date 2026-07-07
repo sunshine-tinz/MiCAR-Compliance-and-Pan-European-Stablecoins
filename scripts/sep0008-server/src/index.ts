@@ -16,7 +16,11 @@ import express, { Request, Response, NextFunction } from "express";
 import { loadConfig, type Config } from "./config";
 import { MockKycProvider, type KycProvider } from "./compliance/kyc";
 import { MockSanctionsProvider, type SanctionsProvider } from "./compliance/sanctions";
-import { MockLimitsProvider, type LimitsProvider } from "./compliance/limits";
+import {
+  EmtTokenLimitsProvider,
+  MockLimitsProvider,
+  type LimitsProvider,
+} from "./compliance/limits";
 import { MockTravelRuleProvider, type TravelRuleProvider } from "./compliance/travelRule";
 import { StellarSigner } from "./stellar/signer";
 import { makeTxApproveHandler } from "./handlers/txApprove";
@@ -25,7 +29,17 @@ const config = loadConfig();
 
 const kyc: KycProvider = new MockKycProvider();
 const sanctions: SanctionsProvider = new MockSanctionsProvider();
-const limits: LimitsProvider = new MockLimitsProvider();
+// LimitsProvider: mock (default, dev/test) or real (production).
+// The real provider reads `emt_token.get_velocity_limit(addr)` and
+// `emt_token.get_outflow_today(addr)` via Soroban RPC. See
+// docs/sep0008-hook.md §6.
+const limits: LimitsProvider = config.mockMode
+  ? new MockLimitsProvider()
+  : new EmtTokenLimitsProvider({
+      rpcUrl: config.stellar.rpcUrl,
+      contractId: config.contracts.emtTokenId,
+      networkPassphrase: config.stellar.networkPassphrase,
+    });
 const travelRule: TravelRuleProvider = new MockTravelRuleProvider();
 const signer = new StellarSigner(config.stellar.hookServerKeypair);
 

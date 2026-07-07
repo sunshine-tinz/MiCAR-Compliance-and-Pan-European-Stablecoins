@@ -48,8 +48,9 @@ npm test
 ```
 
 The Jest suite boots the Express app in-process (via `supertest`) and
-exercises the happy path plus the four documented rejection paths
-(sanctions, KYC pending, invalid XDR, missing field).
+exercises the happy path, the four documented rejection paths
+(sanctions, KYC pending, invalid XDR, missing field), and the
+MiCAR Art. 46 velocity-limit rejection path.
 
 ## Project structure
 
@@ -70,7 +71,8 @@ src/
     └── decoder.ts              # decodeTxXdr → DecodedTx
 
 test/
-└── txApprove.test.ts           # 5 tests covering happy + 4 rejection paths
+├── txApprove.test.ts           # integration tests via supertest
+└── limits.test.ts              # unit tests for MockLimitsProvider + EmtTokenLimitsProvider
 ```
 
 ## What's intentionally NOT in the skeleton
@@ -81,10 +83,10 @@ providers. A production deployment needs:
 - **Real KYC / sanctions / travel-rule provider clients.** The
   interface contracts are defined in `src/compliance/*.ts`; the HTTP
   clients are the next step.
-- **On-chain velocity-limit read.** The skeleton uses a hard-coded
-  per-tx cap; a real impl calls `emt_token.get_velocity_limit(addr)`
-  and `emt_token.get_outflow_today(addr)` via the SDK to project the
-  post-transfer volume.
+- **On-chain velocity-limit read.** Done. `EmtTokenLimitsProvider`
+  reads `emt_token.get_velocity_limit(addr)` and
+  `emt_token.get_outflow_today(addr)` directly via the Soroban RPC
+  client. Wired in automatically when `MOCK_MODE=0`.
 - **Decision persistence.** The `/status/:txHash` endpoint currently
   404s. A real impl persists `{tx_hash, decision, decided_at,
   expires_at_ledger}` in Redis or a small SQL table so the compliance

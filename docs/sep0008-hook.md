@@ -323,6 +323,19 @@ export interface LimitsProvider {
 }
 ```
 
+Two implementations are wired in by `src/index.ts`:
+
+| Provider | Mode | Source of truth |
+|---|---|---|
+| `MockLimitsProvider` | `MOCK_MODE=1` (dev/test, default) | In-process state: `perTxCap` (default `100_000_000n` = 10 EUREMT at 7 dp), per-address overrides (`perAddressLimit`), accumulated outflow (`currentOutflow`). Tests can set `forceExceed: true` to deterministically trigger the rejection path. |
+| `EmtTokenLimitsProvider` | `MOCK_MODE=0` (production) | Direct Soroban RPC reads of `emt_token.get_velocity_limit(addr)` and `emt_token.get_outflow_today(addr)`. `0n` from the on-chain call is treated as unlimited without a second RPC call. |
+
+The handler reads the transfer amount from the XDR-decoded
+operations (native `payment` or Soroban `invokeHostFunction` with an
+`i128` arg) and passes that to `wouldExceed`. When the amount can't
+be recovered (e.g. account-merging ops), the check is skipped — the
+contract side rejects non-transfer ops against `emt_token` regardless.
+
 ```ts
 // src/compliance/travelRule.ts
 export interface TravelRuleProvider {
