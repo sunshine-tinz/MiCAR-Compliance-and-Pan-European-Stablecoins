@@ -87,6 +87,7 @@ to grep for the contract primitive.
 | Aggregate mint cap | Hard ceiling on `total_supply` enforced in `mint()` | `set_aggregate_mint_cap` / `unset_aggregate_mint_cap` |
 | Two-step admin transfer | `propose_admin` + `accept_admin` + `cancel_proposed_admin` | [`docs/admin-handover.md`](docs/admin-handover.md) |
 | 5-year record retention | `extend_storage_ttl` batch-extends every Balance / Allowance / Blocklisted / Velocity entry to the host ceiling | MiCAR Art. 23 / 48 |
+| Oracle-enforced mint gate | `mint()` refuses when `oracle_interface.is_qualified()` is false or stale; admin wires the oracle via `set_oracle_contract(addr)` | MiCAR Art. 45 |
 | `get_admin` / `pending_admin` views | Off-chain tooling reads state | `get_admin` / `pending_admin` |
 
 ### SDK (TypeScript)
@@ -115,7 +116,6 @@ to grep for the contract primitive.
 
 | Issue | Description | Complexity |
 |---|---|---|
-| Oracle-enforced mint gate | `mint()` should refuse when `oracle.is_qualified()` is false or stale. The on-chain wiring (cross-contract call) needs a shared deployment where the oracle contract id is known to the token contract. | High |
 | Multi-sig admin | Replace single admin key with a Soroban native multisig (≥ 2-of-3, ideally 3-of-5). Two-step handover is in place; the multisig sits above it. | High |
 | Lazy-prune tracked addresses | Drop addresses from `TrackedAddresses` / `TrackedAllowances` once their balance is zero for an extended period and no other persistent state exists, to keep the books bounded over the contract's lifetime | Medium |
 

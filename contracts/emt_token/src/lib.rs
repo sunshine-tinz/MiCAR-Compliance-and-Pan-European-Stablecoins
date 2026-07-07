@@ -26,7 +26,6 @@
 //! circulation unless explicitly re-minted.
 //!
 //! ## Open contribution items
-//! - [ ] Oracle integration for automatic reserve sufficiency check
 //! - [ ] Fuzz/property-based tests
 //! - [ ] Lazy-prune TrackedAddresses/TrackedAllowances for addresses
 //!   whose Balance has been zero for an extended period and which have
@@ -38,6 +37,14 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, Map, String, Symbol, Vec,
 };
+// Cross-contract client for `oracle_interface.is_qualified()`. The
+// client is invoked from `mint()` to gate token issuance on the
+// reserve-attestation being qualified *and* fresh; the underlying
+// cross-contract call is a single host `invoke_contract` dispatch.
+// `is_qualified()` returns `bool` and is invoked with no arguments
+// (the oracle keeps its qual-evaluating state in its own instance
+// storage). See [oracle_interface::OracleInterface::is_qualified].
+use oracle_interface::OracleInterfaceClient;
 
 // ── Velocity-limit constants (MiCAR Art. 46) ─────────────────────────────────
 //
@@ -65,6 +72,12 @@ pub enum DataKey {
     TotalSupply,
     /// MiCAR Art. 45 — reserve attestation hash (off-chain report)
     ReserveAttestation,
+    /// MiCAR Art. 45 — `oracle_interface` contract address used by
+    /// `mint()` to consult `is_qualified()` before issuing tokens.
+    /// Absence ⇒ no oracle wired; `mint()` refuses to run (fail loud
+    /// rather than silent) so a misconfigured prod deploy can't mint
+    /// against an unverified reserve.
+    OracleContract,
     /// MiCAR Art. 46 — global default velocity limit (outgoing 24h volume).
     /// `0` means "no limit". Per-address overrides via `VelocityLimit(addr)`.
     GlobalVelocityLimit,
@@ -142,6 +155,9 @@ const CANCEL_AD: Symbol = symbol_short!("CANCEL");
 const TTL_EXT: Symbol = symbol_short!("TTL_EXT");
 /// Aggregate mint cap was set or unset (MiCAR Art. 46).
 const MINT_CAP: Symbol = symbol_short!("MINT_CAP");
+/// Oracle contract address was set or changed (MiCAR Art. 45).
+/// Emitted from `set_oracle_contract`.
+const ORACLE_C_EV: Symbol = symbol_short!("ORACLE_C");
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -237,13 +253,17 @@ impl EmtToken {
     /// Caller must be the designated minter.
     /// Recipient must not be blocklisted.
     /// Contract must not be paused.
+    /// The configured `oracle_interface` must be `is_qualified()`
+    /// (reserve attestation quorum met AND not stale — MiCAR Art. 45).
     /// If an aggregate mint cap is configured, the new total supply
     /// (`total_supply + amount`) must not exceed it.
     ///
     /// # MiCAR
     /// Minting should only occur after fiat funds are received and segregated
     /// in the reserve account (Art. 45). The aggregate cap (Art. 46) is a
-    /// hard ceiling on token issuance.
+    /// hard ceiling on token issuance. The oracle gate is the on-chain
+    /// stand-in for the off-chain attestation flow — it refuses to mint
+    /// against an unverified reserve, regardless of who is calling.
     pub fn mint(env: Env, to: Address, amount: i128) {
         Self::require_not_paused(&env);
         Self::require_minter(&env);
@@ -252,6 +272,15 @@ impl EmtToken {
         assert!(amount > 0, "amount must be positive");
 
         Self::track_address(&env, &to);
+
+        // Oracle gate fires AFTER `track_address` (so a refused mint
+        // still records the recipient in the address book for retention
+        // bookkeeping) and BEFORE the cap check (so a refused mint
+        // doesn't leave stale aggregate-state). The helper panics with
+        // "oracle contract not configured" / "oracle is not qualified"
+        // depending on which branch fired — see `check_oracle_qualified`
+        // for the branching semantics.
+        Self::check_oracle_qualified(&env);
 
         // Aggregate cap check happens BEFORE the balance / supply mutation
         // so a rejected mint doesn't leave stale state. `0` means "no cap"
@@ -513,6 +542,38 @@ impl EmtToken {
             .set(&DataKey::Blocklister, &new_blocklister);
     }
 
+    // ── Oracle gating (MiCAR Art. 45 reserve sufficiency) ──────────────────────
+    //
+    // The oracle contract address is set by admin after deploy (or as
+    // part of a deploy-time chore) and stored under DataKey::OracleContract.
+    // `mint()` consults `oracle_interface.is_qualified()` for every mint,
+    // so the chain refuses to issue EUREMT unless an authorised attestor
+    // has refreshed the reserve attestation within the configured
+    // freshness window AND the attestation has reached the quorum
+    // threshold. See oracle_interface::OracleInterface::is_qualified.
+
+    /// Set the `oracle_interface` contract address used by `mint()` to
+    /// gate issuance on reserve sufficiency (MiCAR Art. 45). Admin only.
+    ///
+    /// Calling this twice overwrites — useful for rotating the oracle
+    /// to a freshly-deployed contract (e.g., after a custodian change)
+    /// without redeploying the token contract.
+    pub fn set_oracle_contract(env: Env, oracle_address: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleContract, &oracle_address);
+        env.events().publish((ORACLE_C_EV,), (oracle_address,));
+    }
+
+    /// Read the currently-configured oracle contract address, if any.
+    /// Mirrors the off-chain tooling view (deploy scripts, ops dashboards,
+    /// monitoring alerts) so a misconfigured deployment surfaces loudly
+    /// in tooling rather than at the first mint attempt.
+    pub fn get_oracle_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::OracleContract)
+    }
+
     // ── Two-step admin handover ──────────────────────────────────────────────
 
     /// **Step 1.** Current admin proposes a successor.
@@ -630,6 +691,36 @@ impl EmtToken {
             .get(&DataKey::Blocklisted(account.clone()))
             .unwrap_or(false);
         assert!(!blocked, "account is blocklisted");
+    }
+
+    /// MiCAR Art. 45 — gate `mint()` on oracle reserve sufficiency.
+    ///
+    /// Three refuse branches; each surfaces a distinct panic message so a
+    /// failed mint is auditable from the host's panic log without further
+    /// context:
+    ///
+    ///   1. **Unconfigured** — `DataKey::OracleContract` has no entry.
+    ///      A misconfigured prod deploy can't silently mint against an
+    ///      unverified reserve; failing loudly is the safety default.
+    ///   2. **Unqualified** — the configured oracle returns `false` from
+    ///      `is_qualified()` (quorum unmet or windowed attestation
+    ///      absent). Production recovery: wait for a corroborating
+    ///      attestation, or call `oracle_interface.reset_window()` and
+    ///      re-anchor the attestor set.
+    ///   3. **Stale** — already encoded in `is_qualified()`: the oracle
+    ///      checks `now <= submission_ledger + max_attestation_age`.
+    ///      This entry surfaces the same path through the same panic
+    ///      ("oracle is not qualified") but the underlying cause is
+    ///      distinguishable by inspecting the oracle's
+    ///      `latest_attestation().ledger` against `max_attestation_age`.
+    fn check_oracle_qualified(env: &Env) {
+        let oracle_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleContract)
+            .expect("oracle contract not configured");
+        let qualified = OracleInterfaceClient::new(env, &oracle_address).is_qualified();
+        assert!(qualified, "oracle is not qualified");
     }
 
     /// Write `account`'s balance to persistent storage and bump its TTL
@@ -1125,6 +1216,26 @@ mod tests {
         let blocklister = Address::generate(&env);
 
         client.initialize(&admin, &minter, &pauser, &blocklister);
+
+        // Register a default oracle contract and submit a baseline
+        // attestation so `mint()` is qualified out of the box. Tests
+        // that need an unqualified oracle (e.g. `test_mint_refused_*`
+        // variants) shouldn't use `setup()` — they should call
+        // `setup_unqualified_oracle()` or build the env state manually.
+        let oracle_id = env.register_contract(None, oracle_interface::OracleInterface);
+        let oracle_admin = Address::generate(&env);
+        let attestor = Address::generate(&env);
+        let oracle_client = oracle_interface::OracleInterfaceClient::new(&env, &oracle_id);
+        oracle_client.initialize(&oracle_admin);
+        oracle_client.add_attestor(&attestor);
+        oracle_client.submit_attestation(
+            &attestor,
+            &100_000_000i128, // 1,000,000.00 EUR reserve (cents)
+            &0i128,            // 0 EUR tokens currently outstanding
+            &String::from_str(&env, "QmSetupDefault"),
+        );
+        client.set_oracle_contract(&oracle_id);
+
         (env, admin, minter, pauser, blocklister, client)
     }
 
@@ -1825,5 +1936,216 @@ mod tests {
         // retention guarantee collapses once a book is archived).
         assert!(book_addr_ttl_after >= 6_312_000 - 1);
         assert!(book_allow_ttl_after >= 6_312_000 - 1);
+    }
+
+    // ── Oracle gating tests (MiCAR Art. 45) ──────────────────────────────
+    //
+    // The default `setup()` registers an oracle contract and submits a
+    // baseline attestation so the gate is qualified for the existing
+    // tests that exercise `mint()`. Tests below exercise the FAIL
+    // branches of the gate — they'll either rebind a custom oracle
+    // (test_mint_succeeds_when_oracle_qualified, test_get_oracle_contract_*)
+    // or skip the default oracle wiring entirely
+    // (test_mint_refused_when_oracle_unconfigured).
+
+    /// Barebones helper — initialise the token contract without
+    /// registering an oracle. Use this to exercise the "unconfigured"
+    /// refuse branch; minting must panic with "oracle contract not
+    /// configured".
+    fn setup_barebones() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        Address,
+        EmtTokenClient<'static>,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmtToken);
+        let client = EmtTokenClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let minter = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let blocklister = Address::generate(&env);
+
+        client.initialize(&admin, &minter, &pauser, &blocklister);
+        // Note: NO `client.set_oracle_contract(...)` call here.
+        (env, admin, minter, pauser, blocklister, client)
+    }
+
+    /// Register a fresh oracle contract, add an attestor, submit a
+    /// baseline attestation, and bind the oracle to the token
+    /// contract. Returns the oracle client so per-test overrides
+    /// (raise quorum, narrow staleness window, remove attestor, etc.)
+    /// can mutate oracle state without touching the token.
+    fn setup_with_oracle() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        Address,
+        EmtTokenClient<'static>,
+        oracle_interface::OracleInterfaceClient<'static>,
+        Address, // attestor address
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let emt_id = env.register_contract(None, EmtToken);
+        let emt_client = EmtTokenClient::new(&env, &emt_id);
+
+        let oracle_id = env.register_contract(None, oracle_interface::OracleInterface);
+        let oracle_client = oracle_interface::OracleInterfaceClient::new(&env, &oracle_id);
+
+        let admin = Address::generate(&env);
+        let minter = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        let blocklister = Address::generate(&env);
+        emt_client.initialize(&admin, &minter, &pauser, &blocklister);
+
+        let oracle_admin = Address::generate(&env);
+        let attestor = Address::generate(&env);
+        oracle_client.initialize(&oracle_admin);
+        oracle_client.add_attestor(&attestor);
+        oracle_client.submit_attestation(
+            &attestor,
+            &100_000_000i128,
+            &0i128,
+            &String::from_str(&env, "QmOracleSetup"),
+        );
+        emt_client.set_oracle_contract(&oracle_id);
+
+        (env, admin, minter, pauser, blocklister, emt_client, oracle_client, attestor)
+    }
+
+    #[test]
+    #[should_panic(expected = "oracle contract not configured")]
+    fn test_mint_refused_when_oracle_unconfigured() {
+        // Barebones fixture: initialise the token but never call
+        // `set_oracle_contract`. `mint()` must panic loudly rather
+        // than silently approve against an unverified reserve.
+        let (env, _a, _m, _p, _b, client) = setup_barebones();
+        let user = Address::generate(&env);
+        client.mint(&user, &1_000_000);
+    }
+
+    #[test]
+    fn test_mint_succeeds_when_oracle_qualified() {
+        // Default `setup()` registers a qualified oracle. Mint
+        // succeeds and post-mint state matches expectations. Pin
+        // the qualified-attestor count so a future regression where
+        // a single-attestor setup silently flips to disqualified
+        // is caught.
+        let (env, _a, _m, _p, _b, client, oracle, _attestor) = setup_with_oracle();
+        assert!(oracle.is_qualified());
+        assert_eq!(oracle.window_count(), 1);
+        let user = Address::generate(&env);
+        client.mint(&user, &1_000_000);
+        assert_eq!(client.balance(&user), 1_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "oracle is not qualified")]
+    fn test_mint_refused_when_quorum_low() {
+        // Raise the quorum threshold above the number of submitted
+        // attestations. `is_qualified()` returns false; `mint()` must
+        // refuse rather than approve.
+        let (env, _a, _m, _p, _b, client, oracle, attestor) = setup_with_oracle();
+        oracle.set_quorum(&3);
+        assert_eq!(oracle.quorum(), 3);
+        assert_eq!(oracle.window_count(), 1);
+        assert!(!oracle.is_qualified());
+        let user = Address::generate(&env);
+        client.mint(&user, &1_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "oracle is not qualified")]
+    fn test_mint_refused_when_attestation_stale() {
+        // Tighten the staleness window so a few ledgers of advance
+        // already flips `is_qualified()` to false. Then mint and
+        // observe the refuse. This proves the oracle's `max_attestation_age`
+        // is honoured by the token's gate.
+        let (env, _a, _m, _p, _b, client, oracle, _attestor) = setup_with_oracle();
+        oracle.set_max_attestation_age(&10);
+        assert!(oracle.is_qualified());
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number.saturating_add(11);
+        });
+        assert!(!oracle.is_qualified());
+        let user = Address::generate(&env);
+        client.mint(&user, &1_000_000);
+    }    #[test]
+    fn test_set_oracle_contract_replaces_existing() {
+        // Admin can rotate the oracle by calling `set_oracle_contract`
+        // again. Useful for custodian changes / oracle redeploys.
+        let (env, _a, _m, _p, _b, client, oracle_initial, _att) = setup_with_oracle();
+        let oracle_initial_id = client.get_oracle_contract().expect("oracle set");
+        let oracle_b_id = env.register_contract(None, oracle_interface::OracleInterface);
+        let oracle_b = oracle_interface::OracleInterfaceClient::new(&env, &oracle_b_id);
+        oracle_b.initialize(&Address::generate(&env));
+        oracle_b.add_attestor(&Address::generate(&env));
+        oracle_b.submit_attestation(
+            &Address::generate(&env),
+            &50_000_000i128,
+            &0i128,
+            &String::from_str(&env, "QmOracleB"),
+        );
+        client.set_oracle_contract(&oracle_b_id);
+        let rotated = client.get_oracle_contract().expect("oracle rotated");
+        assert_eq!(rotated, oracle_b_id);
+        assert_ne!(rotated, oracle_initial_id);
+        // Sanity: the new oracle is qualified, so minting works.
+        let user = Address::generate(&env);
+        client.mint(&user, &1_000_000);
+        assert_eq!(client.balance(&user), 1_000_000);
+        // Reference the initial-oracle client so the unused-variable
+        // linter doesn't fire — it stays bound to a still-alive
+        // contract id and acts only as a test artefact.
+        let _ = oracle_initial;
+    }
+
+    #[test]
+    fn test_set_oracle_contract_publishes_event() {
+        // Each `set_oracle_contract` call publishes a single `ORACLE_C`
+        // event so off-chain tooling (compliance dashboards, rotation
+        // audit logs) can reconcile oracle history. Reading the events
+        // vector BEFORE the call (`events_before`) and AFTER
+        // (`events.len()`) makes the assertion robust against extra
+        // events that the helper or the underlying contract may publish
+        // — a regression that drops the publish would surface as
+        // `events_before == events.len()` rather than be silently
+        // satisfied by side-channel events.
+        let (env, _a, _m, _p, _b, client, _oracle, _att) = setup_with_oracle();
+
+        let events_before = env.events().all().len();
+        let oracle_b_id = env.register_contract(None, oracle_interface::OracleInterface);
+        let oracle_b = oracle_interface::OracleInterfaceClient::new(&env, &oracle_b_id);
+        oracle_b.initialize(&Address::generate(&env));
+        client.set_oracle_contract(&oracle_b_id);
+
+        let events = env.events().all();
+        assert_eq!(
+            events.len(),
+            events_before + 1,
+            "set_oracle_contract must publish exactly one ORACLE_C event"
+        );
+        // Check the newest event's topic count is 1 — proves the
+        // event was published with the documented one-topic shape
+        // (`(ORACLE_C_EV,)`), without coupling the test to the
+        // symbol's ScVal encoding.
+        let last = events.last().expect("events vec is non-empty");
+        let (_contract, topics, _data) = last;
+        assert_eq!(topics.len(), 1, "ORACLE_C event should have a single topic");
+    }
+
+    #[test]
+    fn test_get_oracle_contract_none_before_set() {
+        // Barebones fixture: no `set_oracle_contract` call. The
+        // view must return `None` so off-chain dashboards / deploy
+        // scripts can detect a missing-config deployment.
+        let (_env, _a, _m, _p, _b, client) = setup_barebones();
+        assert!(client.get_oracle_contract().is_none());
     }
 }

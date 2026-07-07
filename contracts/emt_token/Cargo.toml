@@ -8,6 +8,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+# Cross-contract client for `oracle_interface.is_qualified()`. Cheap
+# dependency — workspace path dep, soroban-sdk only, no runtime cost.
+# `OracleInterfaceClient` is the macro-generated client for the
+# publishable surface of the oracle contract (a single bool-returning
+# `is_qualified(env)` view). The same client drives the in-test
+# integration test against a `env.register_contract(None,
+# OracleInterface)` instance in `contracts/emt_token/src/lib.rs`.
+oracle-interface = { path = "../oracle_interface" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

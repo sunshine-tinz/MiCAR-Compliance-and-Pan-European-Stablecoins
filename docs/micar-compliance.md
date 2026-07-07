@@ -35,7 +35,7 @@ This project implements an **EMT** pegged to the Euro.
 - `oracle_interface` contract stores reserve attestations on-chain with quorum + staleness checks (`set_quorum`, `set_max_attestation_age`, `is_qualified`)
 - `set_reserve_attestation()` in `emt_token` anchors the attestation document hash
 - `submit_attestation` is attestor-gated and refuses under-collateralised reports (`reserve_balance must cover token_supply`)
-- **Open:** `mint()` does not yet read the oracle and gate issuance on `is_qualified()` — issuers currently enforce this off-chain. The wiring is a one-liner extension (see [`CONTRIBUTING.md`](../CONTRIBUTING.md))
+- `emt_token::mint()` gates every issuance on `oracle_interface.is_qualified()`: if the oracle contract address is unset, `mint()` panics ("oracle contract not configured"); if `is_qualified()` returns false (quorum unmet or attestation stale), `mint()` panics ("oracle is not qualified"). Admin wires the oracle post-deploy via `set_oracle_contract(address)`; rotation is supported by calling the setter again
 
 ### Art. 23 — AML/CFT Controls
 

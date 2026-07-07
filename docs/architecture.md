@@ -133,20 +133,16 @@ This project draws from:
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full list of open issues.
 High-impact areas:
 
-1. **Oracle-enforced mint gate** — `mint()` should refuse when
-   `oracle.is_qualified()` is false or stale. The interfaces are in
-   place; the cross-contract call needs a single Soroban deployment
-   that exposes the oracle's contract id to the token contract.
-2. **Multi-sig admin** — Replace the single admin key with a Soroban
+1. **Multi-sig admin** — Replace the single admin key with a Soroban
    native multisig (≥ 2-of-3, ideally 3-of-5) for institutional-grade
    key management. Two-step handover (`propose_admin` / `accept_admin`)
    is in place; the multisig sits above it.
-3. **Lazy-prune tracked addresses** — Drop addresses from
+2. **Lazy-prune tracked addresses** — Drop addresses from
    `TrackedAddresses` / `TrackedAllowances` once their balance has been
    zero for an extended period and they have no other persistent
    state, to keep the books bounded as the contract's lifetime grows.
-4. **Real KYC / sanctions / travel-rule provider clients** — the
+3. **Real KYC / sanctions / travel-rule provider clients** — the
    interfaces ship in `scripts/sep0008-server/src/compliance/`; HTTP
    clients (Jumio / Chainalysis / Notabene) are the next step.
-5. **Property-based / fuzz tests** — for mint/burn/transfer arithmetic,
+4. **Property-based / fuzz tests** — for mint/burn/transfer arithmetic,
    overflow edges, and the velocity sliding-window transitions.
