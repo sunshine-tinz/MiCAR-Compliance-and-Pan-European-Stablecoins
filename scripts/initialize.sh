@@ -89,17 +89,28 @@ invoke "$ORACLE_CONTRACT_ID" initialize \
 
 echo ""
 echo "==> All contracts initialized on $NETWORK."
-echo "    Verifying admin reaches each contract:"
-for id in "$EMT_CONTRACT_ID" "$HOOK_CONTRACT_ID" "$ORACLE_CONTRACT_ID"; do
-  echo -n "    $id admin probe: "
-  if stellar contract invoke \
-       --id "$id" --source "$ADMIN_SECRET" \
+echo ""
+# Sanity-check emt_token only — it's the only one of the three that
+# exposes a current-admin read (`get_admin`). compliance_hook and
+# oracle_interface don't expose their admin by design; the three
+# `initialize` calls above are the canonical admin-reachability proof
+# for those two. The previous loop probed every contract with a
+# `get_role Admin` view that none of them exposed — it was dead code
+# that always fell through to a warning.
+echo "    emt_token get_admin (sanity check):"
+if admin_addr="$(stellar contract invoke \
+       --id "$EMT_CONTRACT_ID" --source "$ADMIN_SECRET" \
        --network "$NETWORK" --rpc-url "$RPC_URL" \
        --network-passphrase "$NETWORK_PASSPHRASE" \
-       -- get_role "Admin" >/dev/null 2>&1; then
-    echo "ok"
-  else
-    # fallback: just confirm the contract is reachable
-    echo "(no get_role view; consider adding one for red-team ops)"
-  fi
-done
+       -- get_admin 2>/dev/null)"; then
+  echo "      admin = $admin_addr"
+else
+  echo "      <get_admin failed — investigate RPC / contract state>"
+fi
+echo ""
+echo "    Contract IDs (for off-chain tooling / dashboards):"
+echo "      emt_token        = $EMT_CONTRACT_ID"
+echo "      compliance_hook  = $HOOK_CONTRACT_ID"
+echo "      oracle_interface = $ORACLE_CONTRACT_ID"
+echo ""
+echo "    Next step: ./scripts/verify.sh"
